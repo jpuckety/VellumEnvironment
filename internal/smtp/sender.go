@@ -1,0 +1,124 @@
+package smtp
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/smtp"
+	"time"
+
+	emailpkg "github.com/jordan-wright/email"
+
+	"github.com/jpuckett/EmailMCP/internal/crypto"
+	"github.com/jpuckett/EmailMCP/internal/types"
+)
+
+// Config for SMTP sender.
+type Config struct {
+	DefaultTimeout time.Duration
+	Logger         *slog.Logger
+}
+
+// Sender manages SMTP operations.
+type Sender struct {
+	crypto *crypto.Service
+	cfg    Config
+}
+
+// NewSender creates a new SMTP sender.
+func NewSender(c *crypto.Service, cfg Config) *Sender {
+	if cfg.DefaultTimeout <= 0 {
+		cfg.DefaultTimeout = 30 * time.Second
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return &Sender{crypto: c, cfg: cfg}
+}
+
+// SendEmail sends an email using the specified account's SMTP settings.
+func (s *Sender) SendEmail(ctx context.Context, acc *types.Account, input types.SendEmailInput) error {
+	if acc == nil {
+		return errors.New("account is required")
+	}
+
+	smtpPass, err := s.crypto.DecryptString(acc.SMTPPasswordEnc)
+	if err != nil {
+		return fmt.Errorf("decrypt smtp password: %w", err)
+	}
+
+	from := input.From
+	if from == "" {
+		from = acc.FromAddress
+	}
+	if from == "" {
+		from = acc.SMTPUsername
+	}
+	if from == "" {
+		return errors.New("no from address available")
+	}
+
+	e := emailpkg.NewEmail()
+	e.From = from
+	e.To = input.To
+	e.Cc = input.Cc
+	e.Bcc = input.Bcc
+	e.Subject = input.Subject
+	if input.Text != "" {
+		e.Text = []byte(input.Text)
+	}
+	if input.HTML != "" {
+		e.HTML = []byte(input.HTML)
+	}
+
+	for _, att := range input.Attachments {
+		data, err := base64.StdEncoding.DecodeString(att.Data)
+		if err != nil {
+			return fmt.Errorf("decode attachment %s: %w", att.Filename, err)
+		}
+		ct := att.ContentType
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		e.Attachments = append(e.Attachments, &emailpkg.Attachment{
+			Filename:    att.Filename,
+			ContentType: ct,
+			Header:      make(map[string][]string),
+			Content:     data,
+		})
+	}
+
+	addr := fmt.Sprintf("%s:%d", acc.SMTPHost, acc.SMTPPort)
+
+	// Choose auth and send method
+	auth := smtp.PlainAuth("", acc.SMTPUsername, smtpPass, acc.SMTPHost)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, s.cfg.DefaultTimeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		var sendErr error
+		if acc.SMTPUseTLS {
+			// Use TLS (STARTTLS or direct depending on port convention; library handles common cases)
+			sendErr = e.SendWithTLS(addr, auth, nil)
+		} else {
+			sendErr = e.Send(addr, auth)
+		}
+		done <- sendErr
+	}()
+
+	select {
+	case <-timeoutCtx.Done():
+		return fmt.Errorf("smtp send timeout: %w", timeoutCtx.Err())
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("send email: %w", err)
+		}
+		s.cfg.Logger.Info("email sent", "account_id", acc.ID, "to", input.To, "subject", input.Subject)
+		return nil
+	}
+}

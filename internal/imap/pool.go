@@ -1,0 +1,718 @@
+package imap
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
+
+	"github.com/jpuckett/EmailMCP/internal/crypto"
+	"github.com/jpuckett/EmailMCP/internal/types"
+)
+
+const (
+	defaultMaxConns = 4
+	defaultIdle     = 4 * time.Minute
+)
+
+// Config for the IMAP manager.
+type Config struct {
+	MaxConnsPerAccount int
+	IdleTimeout        time.Duration
+	Logger             *slog.Logger
+}
+
+// Manager manages per-account IMAP connection pools.
+type Manager struct {
+	crypto *crypto.Service
+	cfg    Config
+
+	mu    sync.Mutex
+	pools map[string]*accountPool
+}
+
+type accountPool struct {
+	accountID string
+	imapCfg   imapAccountConfig // decrypted on dial
+
+	mu       sync.Mutex
+	idle     []*pooledConn
+	inUse    int
+	maxConns int
+	idleT    time.Duration
+	logger   *slog.Logger
+	closed   bool
+}
+
+type pooledConn struct {
+	client       *imapclient.Client
+	lastSelected string
+	lastUsed     time.Time
+}
+
+// imapAccountConfig holds the connection info (password plaintext only briefly).
+type imapAccountConfig struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+	UseTLS   bool
+}
+
+// NewManager creates an IMAP connection manager.
+func NewManager(cryptoSvc *crypto.Service, cfg Config) *Manager {
+	if cfg.MaxConnsPerAccount <= 0 {
+		cfg.MaxConnsPerAccount = defaultMaxConns
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaultIdle
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return &Manager{
+		crypto: cryptoSvc,
+		cfg:    cfg,
+		pools:  make(map[string]*accountPool),
+	}
+}
+
+// getOrCreatePool returns the pool for an account.
+func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if p, ok := m.pools[acc.ID]; ok {
+		return p, nil
+	}
+
+	logger := m.cfg.Logger.With("op", "get_or_create_pool", "account_id", acc.ID)
+	logger.Debug("creating new imap pool", "host", acc.IMAPHost, "port", acc.IMAPPort, "use_tls", acc.IMAPUseTLS)
+
+	// Decrypt credentials (only while creating initial config)
+	imapPass, err := m.crypto.DecryptString(acc.IMAPPasswordEnc)
+	if err != nil {
+		logger.Error("failed to decrypt imap password", "error", err)
+		return nil, fmt.Errorf("decrypt imap password: %w", err)
+	}
+
+	p := &accountPool{
+		accountID: acc.ID,
+		imapCfg: imapAccountConfig{
+			Host:     acc.IMAPHost,
+			Port:     acc.IMAPPort,
+			Username: acc.IMAPUsername,
+			Password: imapPass,
+			UseTLS:   acc.IMAPUseTLS,
+		},
+		maxConns: m.cfg.MaxConnsPerAccount,
+		idleT:    m.cfg.IdleTimeout,
+		logger:   m.cfg.Logger,
+		idle:     make([]*pooledConn, 0, m.cfg.MaxConnsPerAccount),
+	}
+
+	m.pools[acc.ID] = p
+	logger.Info("imap pool created", "max_conns", p.maxConns, "idle_timeout", p.idleT)
+	return p, nil
+}
+
+// Acquire gets a connection from the pool for the given account.
+// Caller must call Release when done.
+func (m *Manager) Acquire(ctx context.Context, acc *types.Account) (*pooledConn, error) {
+	pool, err := m.getOrCreatePool(acc)
+	if err != nil {
+		return nil, err
+	}
+	return pool.acquire(ctx)
+}
+
+// Release returns the connection to the pool or closes it on error.
+func (m *Manager) Release(accID string, conn *pooledConn, hadError bool) {
+	m.mu.Lock()
+	p, ok := m.pools[accID]
+	m.mu.Unlock()
+	if !ok || conn == nil {
+		if conn != nil && conn.client != nil {
+			m.cfg.Logger.Warn("releasing connection with no matching pool; closing",
+				"account_id", accID, "had_error", hadError)
+			conn.client.Close()
+		}
+		return
+	}
+	p.release(conn, hadError)
+}
+
+// CloseAll closes all pooled connections (for shutdown).
+func (m *Manager) CloseAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.cfg.Logger.Info("closing all imap pools", "pool_count", len(m.pools))
+	for id, p := range m.pools {
+		p.closeAll()
+		delete(m.pools, id)
+	}
+	m.cfg.Logger.Debug("all imap pools closed")
+}
+
+// --- accountPool implementation ---
+
+func (p *accountPool) acquire(ctx context.Context) (*pooledConn, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	logger := p.logger.With("op", "pool_acquire", "account_id", p.accountID)
+
+	if p.closed {
+		logger.WarnContext(ctx, "acquire on closed pool")
+		return nil, errors.New("pool closed")
+	}
+
+	logger.DebugContext(ctx, "acquiring connection",
+		"idle", len(p.idle), "in_use", p.inUse, "max_conns", p.maxConns)
+
+	// Try idle first
+	for i := len(p.idle) - 1; i >= 0; i-- {
+		c := p.idle[i]
+		p.idle = p.idle[:i]
+		if time.Since(c.lastUsed) > p.idleT {
+			logger.DebugContext(ctx, "discarding idle connection past idle timeout",
+				"idle_for", time.Since(c.lastUsed))
+			c.client.Close()
+			continue
+		}
+		// Quick health check
+		if err := c.client.Noop().Wait(); err != nil {
+			logger.WarnContext(ctx, "idle connection failed NOOP; discarding", "error", err)
+			c.client.Close()
+			continue
+		}
+		p.inUse++
+		c.lastUsed = time.Now()
+		logger.DebugContext(ctx, "reusing idle connection", "in_use", p.inUse)
+		return c, nil
+	}
+
+	// Create new if capacity allows
+	if p.inUse >= p.maxConns {
+		logger.WarnContext(ctx, "connection limit reached",
+			"in_use", p.inUse, "max_conns", p.maxConns)
+		return nil, errors.New("imap connection limit reached for account")
+	}
+
+	conn, err := p.dialAndLogin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p.inUse++
+	logger.DebugContext(ctx, "new connection created", "in_use", p.inUse)
+	return conn, nil
+}
+
+func (p *accountPool) dialAndLogin(ctx context.Context) (*pooledConn, error) {
+	addr := fmt.Sprintf("%s:%d", p.imapCfg.Host, p.imapCfg.Port)
+	logger := p.logger.With("op", "dial_and_login", "account_id", p.accountID,
+		"host", p.imapCfg.Host, "port", p.imapCfg.Port, "use_tls", p.imapCfg.UseTLS)
+
+	start := time.Now()
+	logger.DebugContext(ctx, "dialing imap server")
+
+	var client *imapclient.Client
+	var err error
+
+	if p.imapCfg.UseTLS {
+		client, err = imapclient.DialTLS(addr, &imapclient.Options{
+			// TLSConfig can be customized if needed
+		})
+	} else {
+		client, err = imapclient.DialStartTLS(addr, nil)
+	}
+	if err != nil {
+		logger.ErrorContext(ctx, "imap dial failed", "error", err, "elapsed", time.Since(start))
+		return nil, fmt.Errorf("dial imap %s: %w", addr, err)
+	}
+
+	logger.DebugContext(ctx, "dial complete; logging in",
+		"username", p.imapCfg.Username, "elapsed", time.Since(start))
+
+	// Set deadline aware if possible (library mostly uses Wait())
+	loginCmd := client.Login(p.imapCfg.Username, p.imapCfg.Password)
+	if err := loginCmd.Wait(); err != nil {
+		logger.ErrorContext(ctx, "imap login failed",
+			"error", err, "username", p.imapCfg.Username, "elapsed", time.Since(start))
+		client.Close()
+		return nil, fmt.Errorf("imap login: %w", err)
+	}
+
+	logger.InfoContext(ctx, "imap connection established",
+		"username", p.imapCfg.Username, "elapsed", time.Since(start))
+
+	return &pooledConn{
+		client:   client,
+		lastUsed: time.Now(),
+	}, nil
+}
+
+func (p *accountPool) release(conn *pooledConn, hadError bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	logger := p.logger.With("op", "pool_release", "account_id", p.accountID)
+
+	p.inUse--
+
+	if hadError || p.closed || conn.client == nil {
+		if conn.client != nil {
+			logger.Debug("closing connection on release",
+				"had_error", hadError, "pool_closed", p.closed, "in_use", p.inUse)
+			conn.client.Close()
+		}
+		return
+	}
+
+	// Return to idle
+	conn.lastUsed = time.Now()
+	p.idle = append(p.idle, conn)
+	logger.Debug("connection returned to idle pool",
+		"idle", len(p.idle), "in_use", p.inUse)
+
+	// Trim excess idle connections (keep at most maxConns)
+	for len(p.idle) > p.maxConns {
+		c := p.idle[0]
+		p.idle = p.idle[1:]
+		logger.Debug("trimming excess idle connection", "idle", len(p.idle))
+		c.client.Close()
+	}
+}
+
+func (p *accountPool) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+
+	logger := p.logger.With("op", "pool_close_all", "account_id", p.accountID)
+	logger.Info("closing account pool", "idle", len(p.idle), "in_use", p.inUse)
+
+	for _, c := range p.idle {
+		if c.client != nil {
+			if err := c.client.Logout().Wait(); err != nil {
+				logger.Debug("imap logout returned error during close", "error", err)
+			}
+			c.client.Close()
+		}
+	}
+	p.idle = nil
+}
+
+// --- High level operations ---
+
+// ListFolders lists available mailboxes for the account.
+func (m *Manager) ListFolders(ctx context.Context, acc *types.Account) ([]types.Folder, error) {
+	logger := m.cfg.Logger.With("op", "list_folders", "account_id", acc.ID)
+	logger.DebugContext(ctx, "listing folders")
+
+	start := time.Now()
+
+	conn, err := m.Acquire(ctx, acc)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
+		return nil, err
+	}
+	released := false
+	defer func() {
+		if !released {
+			m.Release(acc.ID, conn, false)
+		}
+	}()
+
+	logger.DebugContext(ctx, "issuing LIST command", "reference", "", "pattern", "%")
+	cmd := conn.client.List("", "%", nil)
+	mailboxes, err := cmd.Collect()
+	if err != nil {
+		logger.ErrorContext(ctx, "LIST command failed",
+			"error", err,
+			"elapsed", time.Since(start))
+		m.Release(acc.ID, conn, true)
+		released = true
+		return nil, fmt.Errorf("list mailboxes: %w", err)
+	}
+
+	folders := make([]types.Folder, 0, len(mailboxes))
+	for _, mb := range mailboxes {
+		f := types.Folder{
+			Name:      mb.Mailbox,
+			Delimiter: string(mb.Delim),
+		}
+		for _, attr := range mb.Attrs {
+			f.Attributes = append(f.Attributes, string(attr))
+		}
+		folders = append(folders, f)
+	}
+
+	logger.InfoContext(ctx, "listed folders",
+		"folder_count", len(folders),
+		"elapsed", time.Since(start))
+
+	return folders, nil
+}
+
+// SearchEmails searches a folder using simple criteria.
+func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder string, criteria imap.SearchCriteria, limit int) ([]types.EmailSummary, error) {
+	if folder == "" {
+		folder = "INBOX"
+	}
+
+	logger := m.cfg.Logger.With("op", "search_emails", "account_id", acc.ID, "folder", folder, "limit", limit)
+	logger.DebugContext(ctx, "searching emails")
+	start := time.Now()
+
+	conn, err := m.Acquire(ctx, acc)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
+		return nil, err
+	}
+	hadErr := false
+	defer func() {
+		m.Release(acc.ID, conn, hadErr)
+	}()
+
+	// Select folder (we track to reduce churn but still select each time for safety)
+	_, err = conn.client.Select(folder, nil).Wait()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
+		return nil, fmt.Errorf("select folder %s: %w", folder, err)
+	}
+	conn.lastSelected = folder
+
+	// Search (prefer UID based)
+	searchCmd := conn.client.UIDSearch(&criteria, nil)
+	data, err := searchCmd.Wait()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "UID SEARCH failed", "error", err, "elapsed", time.Since(start))
+		return nil, fmt.Errorf("search: %w", err)
+	}
+
+	uidList := data.AllUIDs()
+	if len(uidList) == 0 {
+		logger.InfoContext(ctx, "search returned no results", "elapsed", time.Since(start))
+		return []types.EmailSummary{}, nil
+	}
+
+	totalMatches := len(uidList)
+	// Limit
+	if limit > 0 && len(uidList) > limit {
+		uidList = uidList[:limit]
+	}
+	logger.DebugContext(ctx, "fetching summaries", "total_matches", totalMatches, "fetching", len(uidList))
+
+	// Fetch summaries (Envelope + Flags + RFC822.SIZE)
+	fetchOpts := &imap.FetchOptions{
+		Envelope:      true,
+		Flags:         true,
+		BodyStructure: &imap.FetchItemBodyStructure{},
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierHeader},
+		},
+		RFC822Size: true,
+	}
+
+	fetchCmd := conn.client.Fetch(imap.UIDSetNum(uidList...), fetchOpts)
+
+	msgs, err := fetchCmd.Collect()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "FETCH summaries failed", "error", err, "elapsed", time.Since(start))
+		return nil, fmt.Errorf("fetch summaries: %w", err)
+	}
+
+	summaries := make([]types.EmailSummary, 0, len(msgs))
+	for _, msg := range msgs {
+		summary := types.EmailSummary{
+			UID:   uint32(msg.UID),
+			Flags: flagStrings(msg.Flags),
+			Size:  uint32(msg.RFC822Size),
+		}
+		if msg.Envelope != nil {
+			summary.Subject = msg.Envelope.Subject
+			summary.From = convertAddresses(msg.Envelope.From)
+			summary.To = convertAddresses(msg.Envelope.To)
+			summary.Date = msg.Envelope.Date
+		}
+		// Basic detection of attachments via body structure if present
+		if msg.BodyStructure != nil {
+			summary.HasAttach = hasAttachmentStructure(msg.BodyStructure)
+		}
+		summaries = append(summaries, summary)
+	}
+
+	logger.InfoContext(ctx, "search complete",
+		"total_matches", totalMatches, "returned", len(summaries), "elapsed", time.Since(start))
+	return summaries, nil
+}
+
+// GetEmail fetches a full email by UID.
+func (m *Manager) GetEmail(ctx context.Context, acc *types.Account, folder string, uid uint32) (*types.EmailMessage, error) {
+	if folder == "" {
+		folder = "INBOX"
+	}
+
+	logger := m.cfg.Logger.With("op", "get_email", "account_id", acc.ID, "folder", folder, "uid", uid)
+	logger.DebugContext(ctx, "fetching email")
+	start := time.Now()
+
+	conn, err := m.Acquire(ctx, acc)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
+		return nil, err
+	}
+	hadErr := false
+	defer func() {
+		m.Release(acc.ID, conn, hadErr)
+	}()
+
+	_, err = conn.client.Select(folder, nil).Wait()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
+		return nil, fmt.Errorf("select %s: %w", folder, err)
+	}
+	conn.lastSelected = folder
+
+	// Fetch full body + envelope + structure
+	opts := &imap.FetchOptions{
+		Envelope:      true,
+		Flags:         true,
+		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierText},
+		},
+		RFC822Size: true,
+	}
+
+	msgs, err := conn.client.Fetch(imap.UIDSetNum(imap.UID(uid)), opts).Collect()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "FETCH failed", "error", err, "elapsed", time.Since(start))
+		return nil, fmt.Errorf("fetch message: %w", err)
+	}
+	if len(msgs) == 0 {
+		logger.WarnContext(ctx, "message not found", "elapsed", time.Since(start))
+		return nil, errors.New("message not found")
+	}
+	msg := msgs[0]
+
+	em := &types.EmailMessage{
+		EmailSummary: types.EmailSummary{
+			UID:   uint32(msg.UID),
+			Flags: flagStrings(msg.Flags),
+			Size:  uint32(msg.RFC822Size),
+		},
+		Folder: folder,
+	}
+
+	if msg.Envelope != nil {
+		em.Subject = msg.Envelope.Subject
+		em.From = convertAddresses(msg.Envelope.From)
+		em.To = convertAddresses(msg.Envelope.To)
+		em.Date = msg.Envelope.Date
+	}
+
+	// Extract text/html from body sections. For simplicity we take the first text section.
+	// A more robust implementation would walk the body structure.
+	for _, bs := range msg.BodySection {
+		if len(bs.Bytes) > 0 {
+			// Very naive: prefer html if looks like it, else text.
+			content := string(bs.Bytes)
+			if em.HTML == "" && (len(content) > 20 && content[0] == '<') {
+				em.HTML = content
+			} else if em.Text == "" {
+				em.Text = content
+			}
+		}
+	}
+
+	// Extract attachments info from body structure (best effort)
+	if msg.BodyStructure != nil {
+		em.Attachments = extractAttachments(msg.BodyStructure)
+		if hasAttachmentStructure(msg.BodyStructure) {
+			em.HasAttach = true
+		}
+	}
+
+	logger.InfoContext(ctx, "fetched email",
+		"size", em.Size, "has_attach", em.HasAttach,
+		"attachments", len(em.Attachments), "elapsed", time.Since(start))
+	return em, nil
+}
+
+// MoveEmails moves messages by UIDs to destination folder.
+func (m *Manager) MoveEmails(ctx context.Context, acc *types.Account, folder string, uids []uint32, destFolder string) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	if folder == "" {
+		folder = "INBOX"
+	}
+
+	logger := m.cfg.Logger.With("op", "move_emails", "account_id", acc.ID,
+		"folder", folder, "dest_folder", destFolder, "uid_count", len(uids))
+	logger.DebugContext(ctx, "moving emails")
+	start := time.Now()
+
+	conn, err := m.Acquire(ctx, acc)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
+		return err
+	}
+	hadErr := false
+	defer func() { m.Release(acc.ID, conn, hadErr) }()
+
+	_, err = conn.client.Select(folder, nil).Wait()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "SELECT source failed", "error", err, "elapsed", time.Since(start))
+		return fmt.Errorf("select source: %w", err)
+	}
+
+	uidSet := imap.UIDSetNum(uidsToUIDs(uids)...)
+	_, err = conn.client.Move(uidSet, destFolder).Wait()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "MOVE failed", "error", err, "elapsed", time.Since(start))
+		return fmt.Errorf("move: %w", err)
+	}
+
+	logger.InfoContext(ctx, "moved emails", "elapsed", time.Since(start))
+	return nil
+}
+
+// FlagEmails adds or removes flags.
+func (m *Manager) FlagEmails(ctx context.Context, acc *types.Account, folder string, uids []uint32, flags []string, add bool) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	if folder == "" {
+		folder = "INBOX"
+	}
+
+	logger := m.cfg.Logger.With("op", "flag_emails", "account_id", acc.ID,
+		"folder", folder, "uid_count", len(uids), "flags", flags, "add", add)
+	logger.DebugContext(ctx, "updating flags")
+	start := time.Now()
+
+	conn, err := m.Acquire(ctx, acc)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to acquire imap connection", "error", err)
+		return err
+	}
+	hadErr := false
+	defer func() { m.Release(acc.ID, conn, hadErr) }()
+
+	_, err = conn.client.Select(folder, nil).Wait()
+	if err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "SELECT failed", "error", err, "elapsed", time.Since(start))
+		return fmt.Errorf("select: %w", err)
+	}
+
+	imapFlags := make([]imap.Flag, len(flags))
+	for i, f := range flags {
+		imapFlags[i] = imap.Flag(f)
+	}
+
+	storeOp := imap.StoreFlagsAdd
+	if !add {
+		storeOp = imap.StoreFlagsDel
+	}
+
+	uidSet := imap.UIDSetNum(uidsToUIDs(uids)...)
+	storeCmd := conn.client.Store(uidSet, &imap.StoreFlags{
+		Op:     storeOp,
+		Silent: true,
+		Flags:  imapFlags,
+	}, nil)
+	if err := storeCmd.Close(); err != nil {
+		hadErr = true
+		logger.ErrorContext(ctx, "STORE flags failed", "error", err, "elapsed", time.Since(start))
+		return fmt.Errorf("store flags: %w", err)
+	}
+
+	logger.InfoContext(ctx, "flags updated", "elapsed", time.Since(start))
+	return nil
+}
+
+// DeleteEmails marks messages deleted (they may still need EXPUNGE in some servers).
+func (m *Manager) DeleteEmails(ctx context.Context, acc *types.Account, folder string, uids []uint32) error {
+	return m.FlagEmails(ctx, acc, folder, uids, []string{string(imap.FlagDeleted)}, true)
+}
+
+// Helper functions
+
+func flagStrings(flags []imap.Flag) []string {
+	out := make([]string, len(flags))
+	for i, f := range flags {
+		out[i] = string(f)
+	}
+	return out
+}
+
+func convertAddresses(addrs []imap.Address) []types.Address {
+	out := make([]types.Address, 0, len(addrs))
+	for _, a := range addrs {
+		out = append(out, types.Address{Name: a.Name, Address: a.Addr()})
+	}
+	return out
+}
+
+func uidsToUIDs(uids []uint32) []imap.UID {
+	res := make([]imap.UID, len(uids))
+	for i, u := range uids {
+		res[i] = imap.UID(u)
+	}
+	return res
+}
+
+func hasAttachmentStructure(bs imap.BodyStructure) bool {
+	if bs == nil {
+		return false
+	}
+	has := false
+	bs.Walk(func(_ []int, part imap.BodyStructure) bool {
+		if disp := part.Disposition(); disp != nil {
+			if disp.Value == "attachment" || (disp.Value == "inline" && disp.Params["filename"] != "") {
+				has = true
+				return false // found one
+			}
+		}
+		return true
+	})
+	return has
+}
+
+func extractAttachments(bs imap.BodyStructure) []types.Attachment {
+	var atts []types.Attachment
+	if bs == nil {
+		return atts
+	}
+	bs.Walk(func(path []int, part imap.BodyStructure) bool {
+		if disp := part.Disposition(); disp != nil {
+			if disp.Value == "attachment" || (disp.Value == "inline" && disp.Params["filename"] != "") {
+				filename := disp.Params["filename"]
+				atts = append(atts, types.Attachment{
+					Filename:    filename,
+					ContentType: part.MediaType(),
+					Size:        0, // size not directly on interface, skip detailed for now
+				})
+			}
+		}
+		return true
+	})
+	return atts
+}

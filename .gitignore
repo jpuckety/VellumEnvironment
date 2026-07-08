@@ -1,0 +1,37 @@
+# Binaries
+emailmcp
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+emailmcp.db*
+
+# Environment files
+.env
+.env.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Build / dist
+dist/
+bin/
