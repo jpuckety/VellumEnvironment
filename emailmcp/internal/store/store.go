@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/google/uuid"
-	"github.com/jpuckett/EmailMCP/internal/types"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
 var (

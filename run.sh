@@ -8,6 +8,7 @@
 #
 # Common commands:
 #   build         Build the emailmcp binary
+#   install       Install the binary to /usr/local/bin
 #   run           Build (if needed) and run the server
 #   test          Run go test ./...
 #   vet           Run go vet ./...
@@ -22,8 +23,9 @@
 set -euo pipefail
 
 BINARY_NAME="emailmcp"
-BINARY_PATH="./${BINARY_NAME}"
-DB_GLOB="emailmcp.db*"
+APP_DIR="emailmcp"
+BINARY_PATH="${APP_DIR}/${BINARY_NAME}"
+DB_GLOB="${APP_DIR}/emailmcp.db*"
 
 # Colors for output (if supported)
 if [ -t 1 ]; then
@@ -53,7 +55,9 @@ Usage: ./run.sh <command> [options]
 
 Commands:
   build           Build the ${BINARY_NAME} binary
+  install         Build and install the binary and wrapper script
   run             Run the MCP server (loads .env if present)
+                  [--transport http|stdio] Default depends on config.
   test            Run all tests (go test ./...)
   vet             Run go vet ./...
   check           Run test + vet + build
@@ -69,6 +73,7 @@ Examples:
   ./run.sh key
   ./run.sh build
   ./run.sh run
+  ./run.sh run --transport stdio
   EMAILMCP_MASTER_KEY=xxx ./run.sh run
   ./run.sh docker-build
   ./run.sh docker-run
@@ -76,18 +81,18 @@ EOF
 }
 
 # Ensure we are in the project root
-if [[ ! -f "go.mod" || ! -d "cmd/emailmcp" ]]; then
+if [[ ! -d "${APP_DIR}" || ! -f "${APP_DIR}/go.mod" ]]; then
   log_error "This script must be run from the EmailMCP project root."
   exit 1
 fi
 
 load_env() {
-  if [[ -f ".env" ]]; then
-    log_info "Loading environment from .env"
+  if [[ -f "${APP_DIR}/.env" ]]; then
+    log_info "Loading environment from ${APP_DIR}/.env"
     # Export variables from .env (simple parser, ignores comments and empty lines)
     set -a
     # shellcheck disable=SC1091
-    source .env
+    source "${APP_DIR}/.env"
     set +a
   fi
 }
@@ -104,8 +109,28 @@ require_master_key() {
 
 cmd_build() {
   log_info "Building ${BINARY_NAME}..."
-  go build -o "${BINARY_PATH}" ./cmd/emailmcp
+  (cd "${APP_DIR}" && go build -o "${BINARY_NAME}" ./cmd/emailmcp)
   log_success "Built ${BINARY_PATH}"
+}
+
+cmd_install() {
+  cmd_build
+  log_info "Installing ${BINARY_NAME} binary to /usr/local/bin/${BINARY_NAME}-bin..."
+  if sudo install -m 755 "${BINARY_PATH}" /usr/local/bin/"${BINARY_NAME}-bin"; then
+    log_success "Successfully installed ${BINARY_NAME}-bin"
+  else
+    log_error "Failed to install ${BINARY_NAME}-bin"
+    exit 1
+  fi
+
+  log_info "Installing wrapper script to /usr/local/bin/${BINARY_NAME}..."
+  if sudo install -m 755 "${APP_DIR}/emailmcp-wrapper.sh" /usr/local/bin/"${BINARY_NAME}"; then
+    log_success "Successfully installed ${BINARY_NAME} wrapper"
+  else
+    log_error "Failed to install ${BINARY_NAME} wrapper"
+    exit 1
+  fi
+
 }
 
 cmd_run() {
@@ -122,18 +147,18 @@ cmd_run() {
   log_info "Database:       ${EMAILMCP_DB_PATH:-./emailmcp.db}"
   echo
 
-  exec "${BINARY_PATH}"
+  exec "${BINARY_PATH}" "$@"
 }
 
 cmd_test() {
   log_info "Running tests..."
-  go test ./...
+  (cd "${APP_DIR}" && go test ./...)
   log_success "Tests passed"
 }
 
 cmd_vet() {
   log_info "Running go vet..."
-  go vet ./...
+  (cd "${APP_DIR}" && go vet ./...)
   log_success "Vet passed"
 }
 
@@ -164,20 +189,20 @@ cmd_key() {
 }
 
 cmd_setup() {
-  if [[ -f ".env" ]]; then
-    log_warn ".env already exists. Not overwriting."
+  if [[ -f "${APP_DIR}/.env" ]]; then
+    log_warn "${APP_DIR}/.env already exists. Not overwriting."
     log_info "You can edit it manually or remove it and run setup again."
     return 0
   fi
 
-  if [[ ! -f ".env.example" ]]; then
-    log_error ".env.example not found."
+  if [[ ! -f "${APP_DIR}/.env.example" ]]; then
+    log_error "${APP_DIR}/.env.example not found."
     exit 1
   fi
 
-  cp .env.example .env
-  log_success "Created .env from .env.example"
-  log_info "Edit .env and set a real EMAILMCP_MASTER_KEY (use ./run.sh key)"
+  cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
+  log_success "Created ${APP_DIR}/.env from ${APP_DIR}/.env.example"
+  log_info "Edit ${APP_DIR}/.env and set a real EMAILMCP_MASTER_KEY (use ./run.sh key)"
 }
 
 cmd_clean() {
@@ -202,26 +227,13 @@ cmd_clean() {
 
 cmd_docker_build() {
   log_info "Building Docker image 'emailmcp'..."
-  docker build -t emailmcp .
+  docker build -t emailmcp "${APP_DIR}"
   log_success "Docker image 'emailmcp' built"
 }
 
-cmd_docker_run() {
-  if [[ -z "${EMAILMCP_MASTER_KEY:-}" ]]; then
-    log_error "EMAILMCP_MASTER_KEY must be set when running via Docker."
-    log_info "Example:"
-    log_info "  EMAILMCP_MASTER_KEY=yourkey ./run.sh docker-run"
-    log_info "Or:"
-    log_info "  docker run -e EMAILMCP_MASTER_KEY=yourkey -p 8081:8080 emailmcp"
-    exit 1
-  fi
-
+cmd_docker_compose() {
   log_info "Running Docker container..."
-  docker run --rm \
-    -e EMAILMCP_MASTER_KEY="${EMAILMCP_MASTER_KEY}" \
-    -e EMAILMCP_LISTEN_ADDR="${EMAILMCP_LISTEN_ADDR:-:8080}" \
-    -p 8001:8080 \
-    emailmcp
+  docker compose up -d
 }
 
 main() {
@@ -236,6 +248,9 @@ main() {
   case "$cmd" in
     build)
       cmd_build "$@"
+      ;;
+    install)
+      cmd_install "$@"
       ;;
     run)
       cmd_run "$@"
@@ -261,8 +276,8 @@ main() {
     docker-build|docker_build)
       cmd_docker_build "$@"
       ;;
-    docker-run|docker_run)
-      cmd_docker_run "$@"
+    docker-run|docker_run|docker-compose|docker_compose)
+      cmd_docker_compose "$@"
       ;;
     help|-h|--help)
       usage

@@ -1,4 +1,4 @@
-module github.com/jpuckett/EmailMCP
+module github.com/jpuckett/EmailMCP/emailmcp
 
 go 1.25.0
 

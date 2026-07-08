@@ -11,8 +11,8 @@ import (
 
 	emailpkg "github.com/jordan-wright/email"
 
-	"github.com/jpuckett/EmailMCP/internal/crypto"
-	"github.com/jpuckett/EmailMCP/internal/types"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/crypto"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
 // Config for SMTP sender.

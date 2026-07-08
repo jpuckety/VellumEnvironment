@@ -11,8 +11,8 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 
-	"github.com/jpuckett/EmailMCP/internal/crypto"
-	"github.com/jpuckett/EmailMCP/internal/types"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/crypto"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
 const (

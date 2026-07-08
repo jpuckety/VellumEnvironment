@@ -24,6 +24,9 @@ type Config struct {
 
 	// Logging
 	LogLevel string
+
+	// Transport
+	Transport string // "http" or "stdio"
 }
 
 // Load reads configuration from environment with sensible defaults.
@@ -35,6 +38,7 @@ func Load() (*Config, error) {
 		IMAPConnIdleTimeout:    getEnvDuration("EMAILMCP_IMAP_IDLE_TIMEOUT", 5*time.Minute),
 		SMTPDefaultTimeout:     getEnvDuration("EMAILMCP_SMTP_TIMEOUT", 30*time.Second),
 		LogLevel:               getEnv("EMAILMCP_LOG_LEVEL", "info"),
+		Transport:              getEnv("EMAILMCP_TRANSPORT", "http"),
 	}
 
 	if cfg.IMAPMaxConnsPerAccount < 1 {

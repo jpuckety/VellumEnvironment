@@ -12,12 +12,12 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/jpuckett/EmailMCP/internal/config"
-	"github.com/jpuckett/EmailMCP/internal/crypto"
-	imapmgr "github.com/jpuckett/EmailMCP/internal/imap"
-	"github.com/jpuckett/EmailMCP/internal/smtp"
-	"github.com/jpuckett/EmailMCP/internal/store"
-	"github.com/jpuckett/EmailMCP/internal/types"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/crypto"
+	imapmgr "github.com/jpuckett/EmailMCP/emailmcp/internal/imap"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/smtp"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/store"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
 // Server wraps the MCP server and dependencies.
@@ -64,7 +64,9 @@ func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *c
 		cfg:       cfg,
 	}
 
+	es.logger.Info("initializing EmailMCP server", "name", "emailmcp", "version", "0.1.0")
 	es.registerTools()
+	es.logger.Info("mcp server initialized")
 
 	return es, nil
 }
@@ -79,12 +81,23 @@ func (s *Server) HTTPHandler() http.Handler {
 	return httpLogging(s.logger, mcpHandler)
 }
 
+// ServeStdio runs the MCP server on the stdio transport.
+func (s *Server) ServeStdio(ctx context.Context) error {
+	return s.mcpServer.Run(ctx, &mcp.StdioTransport{})
+}
+
 // httpLogging logs every incoming HTTP request/response at Debug level. It does
 // NOT log bodies because MCP payloads may contain email content or account
 // credentials (see the project's Security Rules in agents.md).
 func httpLogging(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+
+		isSSE := r.Header.Get("Accept") == "text/event-stream"
+		level := slog.LevelDebug
+		if isSSE {
+			level = slog.LevelInfo
+		}
 
 		// Redact sensitive headers before logging.
 		hdrs := make(map[string]string, len(r.Header))
@@ -97,7 +110,7 @@ func httpLogging(logger *slog.Logger, next http.Handler) http.Handler {
 			}
 		}
 
-		logger.Debug("http request",
+		logger.Log(r.Context(), level, "http request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"query", r.URL.RawQuery,
@@ -114,7 +127,7 @@ func httpLogging(logger *slog.Logger, next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
-		logger.Debug("http response",
+		logger.Log(r.Context(), level, "http response",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,

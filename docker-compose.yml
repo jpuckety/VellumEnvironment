@@ -1,0 +1,29 @@
+services:
+  emailmcp:
+    build:
+      context: emailmcp
+      dockerfile: Dockerfile
+    container_name: emailmcp
+    restart: always
+    env_file: emailmcp/.env
+    environment:
+      - EMAILMCP_LISTEN_ADDR=:8080
+      - EMAILMCP_DB_PATH=/data/emailmcp.db
+    ports:
+      - "8080:8080"
+    volumes:
+      - emailmcp-data:/data
+
+  vellum-assistant:
+    image: vellumai/vellum-assistant:latest
+    container_name: vellum-assistant
+    restart: always
+    environment:
+      - PORT=8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - emailmcp
+
+volumes:
+  emailmcp-data:
