@@ -54,7 +54,7 @@ EmailMCP run helper
 Usage: ./run.sh <command> [options]
 
 Commands:
-  build           Build the ${BINARY_NAME} binary
+  build           Build the ${BINARY_NAME} binaries (multi-arch)
   install         Build and install the binary and wrapper script
   run             Run the MCP server (loads .env if present)
                   [--transport http|stdio] Default depends on config.
@@ -108,9 +108,15 @@ require_master_key() {
 }
 
 cmd_build() {
-  log_info "Building ${BINARY_NAME}..."
+  log_info "Building ${BINARY_NAME} for multiple architectures (Linux)..."
+
+  log_info "  - Linux x86_64 (amd64)..."
+  (cd "${APP_DIR}" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "${BINARY_NAME}-x86_64" ./cmd/emailmcp)
+
+  log_info "  - Native (default)..."
   (cd "${APP_DIR}" && go build -o "${BINARY_NAME}" ./cmd/emailmcp)
-  log_success "Built ${BINARY_PATH}"
+
+  log_success "Build complete. Binaries located in ${APP_DIR}/"
 }
 
 cmd_install() {
@@ -211,6 +217,16 @@ cmd_clean() {
   if [[ -f "${BINARY_PATH}" ]]; then
     rm -f "${BINARY_PATH}"
     log_success "Removed ${BINARY_PATH}"
+  fi
+
+  # Remove architecture-specific binaries
+  if [[ -f "${BINARY_PATH}-x86_64" ]]; then
+    rm -f "${BINARY_PATH}-x86_64"
+    log_success "Removed ${BINARY_PATH}-x86_64"
+  fi
+  if [[ -f "${BINARY_PATH}-arm64" ]]; then
+    rm -f "${BINARY_PATH}-arm64"
+    log_success "Removed ${BINARY_PATH}-arm64"
   fi
 
   # Remove database files (including WAL files)
