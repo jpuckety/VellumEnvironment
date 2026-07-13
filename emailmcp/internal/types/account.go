@@ -13,7 +13,9 @@ type Account struct {
 	IMAPHost     string `json:"imap_host"`
 	IMAPPort     int    `json:"imap_port"`
 	IMAPUsername string `json:"imap_username"`
-	// IMAPPassword is stored encrypted in the database.
+	// IMAPPassword is used when fetching from the Config API (plaintext).
+	IMAPPassword string `json:"password,omitempty"`
+	// IMAPPasswordEnc is stored encrypted in the database.
 	IMAPPasswordEnc string `json:"-"`
 	IMAPUseTLS      bool   `json:"imap_use_tls"`
 
@@ -21,7 +23,9 @@ type Account struct {
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port"`
 	SMTPUsername string `json:"smtp_username"`
-	// SMTPPassword is stored encrypted in the database.
+	// SMTPPassword is used when fetching from the Config API (plaintext).
+	SMTPPassword string `json:"smtp_password,omitempty"`
+	// SMTPPasswordEnc is stored encrypted in the database.
 	SMTPPasswordEnc string `json:"-"`
 	SMTPUseTLS      bool   `json:"smtp_use_tls"`
 

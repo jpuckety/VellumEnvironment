@@ -5,12 +5,18 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 ## Features
 
 ### IMAP (Inbound)
-- Secure AES-256-GCM encrypted credential storage
+- Secure AES-256-GCM encrypted credential storage (Standalone) or AWS Secrets Manager (Cloud)
 - Robust per-account IMAP connection pooling with health checks and limits
 - List folders
 - Search emails (text, from, since, etc.)
 - Read full emails (envelope + body + attachment metadata)
 - Move, flag, and delete (single and bulk)
+
+### Multi-User & Cloud Architecture
+- **Google OAuth2 Authentication**: Secure multi-user isolation using Google ID tokens.
+- **Hybrid Storage Model**: General configuration in Amazon DynamoDB and sensitive credentials in AWS Secrets Manager.
+- **AWS CDK Infrastructure**: Fully automated resource provisioning using TypeScript.
+- **Config API Layer**: Lightweight Python Lambda gateway for configuration management.
 
 ### SMTP (Outbound)
 - Send plain text + HTML emails
@@ -26,9 +32,24 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 ## Requirements
 
 - Go 1.25+ (due to MCP SDK)
-- A 32-byte base64 master encryption key
+- Node.js & npm (for CDK infrastructure)
+- Python 3.12 (for Config API Lambda)
+- AWS CLI configured with appropriate credentials
+- A 32-byte base64 master encryption key (for standalone mode)
 
-## Quick Start
+## Quick Start (Cloud Deployment)
+
+```bash
+# 1. Setup environment
+./run.sh setup
+
+# 2. Deploy to AWS (dev environment)
+./run.sh deploy dev
+```
+
+The `run.sh` script automates building the Go binary, packaging the Lambda, and deploying the CDK stack.
+
+## Standalone Quick Start
 
 ```bash
 # 1. Clone and build
@@ -46,7 +67,7 @@ cp .env.example .env
 # Edit .env and set EMAILMCP_MASTER_KEY
 
 # 4. Run
-./emailmcp
+./run.sh run
 ```
 
 The server listens on `:8080` by default and serves the Streamable HTTP transport at `/`.
@@ -170,6 +191,19 @@ go build ./...
 - Master key must be provided via environment only.
 - Use TLS for IMAP/SMTP in production.
 - Consider running behind a reverse proxy with auth if exposing publicly.
+
+## Cloud Architecture
+
+EmailMCP is now ready for cloud-native deployment with the following components:
+
+- **Go MCP Server**: Validates Google ID tokens and dynamically fetches per-user configuration.
+- **Python Config API (AWS Lambda)**: Serves as a secure gateway between the MCP server and storage.
+- **Hybrid Storage**:
+  - **DynamoDB**: Stores non-sensitive user metadata and IMAP server settings.
+  - **Secrets Manager**: Securely stores IMAP passwords, indexed by `applicationId` and `userId`.
+- **AWS CDK**: Defines and provisions all resources including KMS keys for encryption, IAM roles for least-privilege access, and CloudTrail for audit logging.
+
+For more details on the deployment process, see the root-level `run.sh` script and the `infrastructure/` directory.
 
 ## License
 

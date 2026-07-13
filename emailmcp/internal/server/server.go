@@ -22,13 +22,15 @@ import (
 
 // Server wraps the MCP server and dependencies.
 type Server struct {
-	mcpServer *mcp.Server
-	store     *store.Store
-	imapMgr   *imapmgr.Manager
-	smtpSend  *smtp.Sender
-	crypto    *crypto.Service
-	logger    *slog.Logger
-	cfg       *config.Config
+	mcpServer     *mcp.Server
+	store         *store.Store
+	imapMgr       *imapmgr.Manager
+	smtpSend      *smtp.Sender
+	crypto        *crypto.Service
+	logger        *slog.Logger
+	cfg           *config.Config
+	authenticator *Authenticator
+	configClient  *config.Client
 }
 
 // New creates and configures the EmailMCP server.
@@ -54,14 +56,30 @@ func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *c
 		Version: "0.1.0",
 	}, nil)
 
+	var auth *Authenticator
+	if cfg.GoogleClientID != "" {
+		var err error
+		auth, err = NewAuthenticator(ctx, cfg.GoogleClientID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create authenticator: %w", err)
+		}
+	}
+
+	var configClient *config.Client
+	if cfg.ConfigAPIURL != "" {
+		configClient = config.NewClient(cfg.ConfigAPIURL, cfg.ApplicationID)
+	}
+
 	es := &Server{
-		mcpServer: srv,
-		store:     st,
-		imapMgr:   imapMgr,
-		smtpSend:  smtpSender,
-		crypto:    cryptoSvc,
-		logger:    slog.Default(),
-		cfg:       cfg,
+		mcpServer:     srv,
+		store:         st,
+		imapMgr:       imapMgr,
+		smtpSend:      smtpSender,
+		crypto:        cryptoSvc,
+		logger:        slog.Default(),
+		cfg:           cfg,
+		authenticator: auth,
+		configClient:  configClient,
 	}
 
 	es.logger.Info("initializing EmailMCP server", "name", "emailmcp", "version", "0.1.0")
@@ -71,14 +89,21 @@ func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *c
 	return es, nil
 }
 
-// HTTPHandler returns the Streamable HTTP handler wrapped with request/response logging.
+// HTTPHandler returns the Streamable HTTP handler wrapped with request/response logging and authentication.
 func (s *Server) HTTPHandler() http.Handler {
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 		return s.mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Logger: s.logger,
 	})
-	return httpLogging(s.logger, mcpHandler)
+
+	handler := httpLogging(s.logger, mcpHandler)
+
+	if s.authenticator != nil {
+		handler = s.authenticator.Middleware(handler)
+	}
+
+	return handler
 }
 
 // ServeStdio runs the MCP server on the stdio transport.
@@ -482,6 +507,21 @@ func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in Sen
 // --- Helpers ---
 
 func (s *Server) getAccount(ctx context.Context, id string) (*types.Account, error) {
+	// If authenticated and config API is available, use it.
+	if userInfo, ok := UserFromContext(ctx); ok && s.configClient != nil {
+		token, _ := TokenFromContext(ctx)
+		s.logger.Debug("fetching config from API", "user", userInfo.Email, "sub", userInfo.Subject)
+		acc, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject)
+		if err != nil {
+			return nil, fmt.Errorf("fetch config from api: %w", err)
+		}
+		// Set an ID if missing
+		if acc.ID == "" {
+			acc.ID = userInfo.Subject
+		}
+		return acc, nil
+	}
+
 	if id == "" {
 		return nil, errors.New("account_id is required")
 	}

@@ -1,5 +1,6 @@
 # Binaries
-emailmcp
+/emailmcp
+/emailmcp-x86_64
 *.exe
 *.exe~
 *.dll

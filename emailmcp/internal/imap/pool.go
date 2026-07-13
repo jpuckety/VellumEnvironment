@@ -95,10 +95,14 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 	logger.Debug("creating new imap pool", "host", acc.IMAPHost, "port", acc.IMAPPort, "use_tls", acc.IMAPUseTLS)
 
 	// Decrypt credentials (only while creating initial config)
-	imapPass, err := m.crypto.DecryptString(acc.IMAPPasswordEnc)
-	if err != nil {
-		logger.Error("failed to decrypt imap password", "error", err)
-		return nil, fmt.Errorf("decrypt imap password: %w", err)
+	imapPass := acc.IMAPPassword
+	if imapPass == "" {
+		var err error
+		imapPass, err = m.crypto.DecryptString(acc.IMAPPasswordEnc)
+		if err != nil {
+			logger.Error("failed to decrypt imap password", "error", err)
+			return nil, fmt.Errorf("decrypt imap password: %w", err)
+		}
 	}
 
 	p := &accountPool{

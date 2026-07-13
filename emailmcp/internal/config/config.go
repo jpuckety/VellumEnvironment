@@ -27,6 +27,11 @@ type Config struct {
 
 	// Transport
 	Transport string // "http" or "stdio"
+
+	// Auth & Hybrid Storage
+	ApplicationID  string
+	ConfigAPIURL   string
+	GoogleClientID string
 }
 
 // Load reads configuration from environment with sensible defaults.
@@ -39,6 +44,9 @@ func Load() (*Config, error) {
 		SMTPDefaultTimeout:     getEnvDuration("EMAILMCP_SMTP_TIMEOUT", 30*time.Second),
 		LogLevel:               getEnv("EMAILMCP_LOG_LEVEL", "info"),
 		Transport:              getEnv("EMAILMCP_TRANSPORT", "http"),
+		ApplicationID:          getEnv("APPLICATION_ID", "default"),
+		ConfigAPIURL:           getEnv("CONFIG_API_URL", ""),
+		GoogleClientID:         getEnv("GOOGLE_CLIENT_ID", ""),
 	}
 
 	if cfg.IMAPMaxConnsPerAccount < 1 {

@@ -2,6 +2,7 @@ package smtp
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -44,9 +45,13 @@ func (s *Sender) SendEmail(ctx context.Context, acc *types.Account, input types.
 		return errors.New("account is required")
 	}
 
-	smtpPass, err := s.crypto.DecryptString(acc.SMTPPasswordEnc)
-	if err != nil {
-		return fmt.Errorf("decrypt smtp password: %w", err)
+	smtpPass := acc.SMTPPassword
+	if smtpPass == "" {
+		var err error
+		smtpPass, err = s.crypto.DecryptString(acc.SMTPPasswordEnc)
+		if err != nil {
+			return fmt.Errorf("decrypt smtp password: %w", err)
+		}
 	}
 
 	from := input.From
@@ -100,11 +105,20 @@ func (s *Sender) SendEmail(ctx context.Context, acc *types.Account, input types.
 
 	done := make(chan error, 1)
 
+	tlsConfig := &tls.Config{
+		ServerName: acc.SMTPHost,
+		MinVersion: tls.VersionTLS12,
+	}
+
 	go func() {
 		var sendErr error
 		if acc.SMTPUseTLS {
-			// Use TLS (STARTTLS or direct depending on port convention; library handles common cases)
-			sendErr = e.SendWithTLS(addr, auth, nil)
+			// 465 = implicit TLS; 587/25 = plain then STARTTLS
+			if acc.SMTPPort == 465 {
+				sendErr = e.SendWithTLS(addr, auth, tlsConfig)
+			} else {
+				sendErr = e.SendWithStartTLS(addr, auth, tlsConfig)
+			}
 		} else {
 			sendErr = e.Send(addr, auth)
 		}

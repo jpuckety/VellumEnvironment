@@ -26,6 +26,8 @@ BINARY_NAME="emailmcp"
 APP_DIR="emailmcp"
 BINARY_PATH="${APP_DIR}/${BINARY_NAME}"
 DB_GLOB="${APP_DIR}/emailmcp.db*"
+LAMBDA_DIR="emailmcp-config-api"
+INFRA_DIR="infrastructure"
 
 # Colors for output (if supported)
 if [ -t 1 ]; then
@@ -66,6 +68,10 @@ Commands:
   clean           Remove binary, DB files, and other artifacts
   docker-build    Build Docker image as 'emailmcp'
   docker-run      Run Docker container (port 8080)
+  package-lambda  Package the Python Config API Lambda
+  synth           Synthesize CDK infrastructure
+  deploy          Build, package, and deploy the complete solution
+  destroy         Teardown the CDK infrastructure
   help            Show this message
 
 Examples:
@@ -77,6 +83,8 @@ Examples:
   EMAILMCP_MASTER_KEY=xxx ./run.sh run
   ./run.sh docker-build
   ./run.sh docker-run
+  ./run.sh deploy dev
+  ./run.sh synth
 EOF
 }
 
@@ -237,6 +245,7 @@ cmd_clean() {
 
   # Remove common temp files
   rm -f *.out 2>/dev/null || true
+  rm -rf "${LAMBDA_DIR}/dist" 2>/dev/null || true
 
   log_success "Clean complete"
 }
@@ -250,6 +259,41 @@ cmd_docker_build() {
 cmd_docker_compose() {
   log_info "Running Docker container..."
   docker compose up -d
+}
+
+cmd_package_lambda() {
+  log_info "Packaging Python Lambda function..."
+  # Clean old dist
+  rm -rf "${LAMBDA_DIR}/dist"
+  mkdir -p "${LAMBDA_DIR}/dist"
+  
+  # Copy main.py
+  cp "${LAMBDA_DIR}/main.py" "${LAMBDA_DIR}/dist/"
+  
+  # Install dependencies to dist folder
+  log_info "  - Installing Python dependencies..."
+  python3 -m pip install -r "${LAMBDA_DIR}/requirements.txt" -t "${LAMBDA_DIR}/dist" --quiet
+  
+  log_success "Lambda packaged in ${LAMBDA_DIR}/dist"
+}
+
+cmd_synth() {
+  cmd_package_lambda
+  log_info "Running cdk synth..."
+  (cd "${INFRA_DIR}" && npx cdk synth)
+}
+
+cmd_deploy() {
+  log_info "Starting full deployment..."
+  cmd_build
+  cmd_package_lambda
+  log_info "Running cdk deploy..."
+  (cd "${INFRA_DIR}" && npx cdk deploy "$@")
+}
+
+cmd_destroy() {
+  log_info "Tearing down infrastructure..."
+  (cd "${INFRA_DIR}" && npx cdk destroy "$@")
 }
 
 main() {
@@ -294,6 +338,18 @@ main() {
       ;;
     docker-run|docker_run|docker-compose|docker_compose)
       cmd_docker_compose "$@"
+      ;;
+    package-lambda|package_lambda)
+      cmd_package_lambda "$@"
+      ;;
+    synth)
+      cmd_synth "$@"
+      ;;
+    deploy)
+      cmd_deploy "$@"
+      ;;
+    destroy)
+      cmd_destroy "$@"
       ;;
     help|-h|--help)
       usage
