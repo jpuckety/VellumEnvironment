@@ -2,7 +2,7 @@
 
 This repository contains a group of projects focused on the Vellum environment.
 
-## Projects
+## Sub-Projects
 
 ### [EmailMCP](./emailmcp)
 A Model Context Protocol (MCP) server that exposes email capabilities (IMAP + SMTP) to AI agents.
