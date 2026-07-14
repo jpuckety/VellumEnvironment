@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -59,36 +60,93 @@ func Load() (*Config, error) {
 	}
 
 	if cfg.IMAPMaxConnsPerAccount < 1 {
+		slog.Warn("EMAILMCP_IMAP_MAX_CONNS < 1; clamping to 1",
+			"configured", cfg.IMAPMaxConnsPerAccount,
+		)
 		cfg.IMAPMaxConnsPerAccount = 1
 	}
+
+	// Never log GoogleClientSecret or other secrets.
+	slog.Info("configuration loaded from environment",
+		"listen_addr", cfg.ListenAddr,
+		"imap_max_conns", cfg.IMAPMaxConnsPerAccount,
+		"imap_idle_timeout", cfg.IMAPConnIdleTimeout,
+		"smtp_timeout", cfg.SMTPDefaultTimeout,
+		"log_level", cfg.LogLevel,
+		"transport", cfg.Transport,
+		"application_id", cfg.ApplicationID,
+		"config_api_url_set", cfg.ConfigAPIURL != "",
+		"config_api_url", cfg.ConfigAPIURL,
+		"google_client_id_set", cfg.GoogleClientID != "",
+		"google_client_secret_set", cfg.GoogleClientSecret != "",
+		"public_base_url", cfg.PublicBaseURL,
+		"aws_region", os.Getenv("AWS_REGION"),
+	)
 
 	return cfg, nil
 }
 
 // FetchRemoteDefaults attempts to load missing configuration from AWS SSM if available.
 func (c *Config) FetchRemoteDefaults(ctx context.Context) {
+	logger := slog.Default().With("op", "fetch_remote_defaults")
+
 	if c.ConfigAPIURL != "" {
+		logger.DebugContext(ctx, "skipping SSM lookup; CONFIG_API_URL already set",
+			"config_api_url", c.ConfigAPIURL,
+		)
 		return
 	}
 
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
+		logger.DebugContext(ctx, "skipping SSM lookup; AWS_REGION unset and CONFIG_API_URL empty")
 		return
 	}
 
-	// Load AWS config
+	const paramName = "/emailmcp/config-api/url"
+	logger.InfoContext(ctx, "resolving CONFIG_API_URL from SSM",
+		"parameter", paramName,
+		"region", region,
+	)
+
+	start := time.Now()
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
+		logger.WarnContext(ctx, "failed to load AWS config for SSM lookup",
+			"region", region,
+			"error", err,
+			"elapsed", time.Since(start),
+		)
 		return
 	}
 
 	client := ssm.NewFromConfig(cfg)
 	out, err := client.GetParameter(ctx, &ssm.GetParameterInput{
-		Name: aws.String("/emailmcp/config-api/url"),
+		Name: aws.String(paramName),
 	})
-	if err == nil && out.Parameter != nil && out.Parameter.Value != nil {
-		c.ConfigAPIURL = *out.Parameter.Value
+	if err != nil {
+		logger.WarnContext(ctx, "SSM GetParameter failed",
+			"parameter", paramName,
+			"region", region,
+			"error", err,
+			"elapsed", time.Since(start),
+		)
+		return
 	}
+	if out.Parameter == nil || out.Parameter.Value == nil || *out.Parameter.Value == "" {
+		logger.WarnContext(ctx, "SSM parameter missing or empty",
+			"parameter", paramName,
+			"elapsed", time.Since(start),
+		)
+		return
+	}
+
+	c.ConfigAPIURL = *out.Parameter.Value
+	logger.InfoContext(ctx, "CONFIG_API_URL resolved from SSM",
+		"parameter", paramName,
+		"config_api_url", c.ConfigAPIURL,
+		"elapsed", time.Since(start),
+	)
 }
 
 func getEnv(key, def string) string {
@@ -103,6 +161,11 @@ func getEnvInt(key string, def int) int {
 		if i, err := strconv.Atoi(v); err == nil {
 			return i
 		}
+		slog.Warn("invalid integer env var; using default",
+			"key", key,
+			"value", v,
+			"default", def,
+		)
 	}
 	return def
 }
@@ -112,6 +175,11 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
+		slog.Warn("invalid duration env var; using default",
+			"key", key,
+			"value", v,
+			"default", def,
+		)
 	}
 	return def
 }
