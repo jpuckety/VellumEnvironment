@@ -2,8 +2,6 @@ import json
 import os
 import boto3
 from botocore.exceptions import ClientError
-from google.oauth2 import id_token
-from google.auth.transport import requests
 
 dynamodb = boto3.resource('dynamodb')
 secretsmanager = boto3.client('secretsmanager')
@@ -13,6 +11,21 @@ table = dynamodb.Table(TABLE_NAME)
 
 def handler(event, context):
     try:
+        # Lambda Function URL can use rawPath (for v2) or path (for v1/rest)
+        path = event.get('rawPath', event.get('path', ''))
+        method = event.get('requestContext', {}).get('http', {}).get('method', event.get('httpMethod'))
+
+        # Health check — no Google auth required (IAM still enforced at Function URL).
+        # Keep this path free of optional imports so cold-start health stays reliable.
+        if path.rstrip('/') == '/health' or path.strip('/') == 'health':
+            if method and method != 'GET':
+                return response(405, {'error': 'Method not allowed'})
+            return response(200, {'status': 'ok'})
+
+        # Lazy-import Google auth so /health works even if google-auth deps are missing.
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+
         # 1. Authenticate
         headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
         auth_header = headers.get('authorization', '')
@@ -26,15 +39,13 @@ def handler(event, context):
         try:
             # We verify the token. In a real world app, you'd specify the audience (client ID)
             # but if it's not provided, we just verify the signature and expiration.
-            id_info = id_token.verify_oauth2_token(token, requests.Request(), google_client_id)
+            id_info = id_token.verify_oauth2_token(token, google_requests.Request(), google_client_id)
             user_id = id_info['sub']
             # email = id_info['email']
         except Exception as e:
             return response(401, {'error': f'Invalid token: {str(e)}'})
 
         # 2. Parse Path
-        # Lambda Function URL can use rawPath (for v2) or path (for v1/rest)
-        path = event.get('rawPath', event.get('path', ''))
         parts = path.strip('/').split('/')
         if len(parts) != 3 or parts[0] != 'configs':
             return response(400, {'error': 'Invalid path format. Expected /configs/{applicationId}/{userId}'})
@@ -45,8 +56,6 @@ def handler(event, context):
         # 3. Authorize - User can only access their own userId
         if path_user_id != user_id:
             return response(403, {'error': 'Forbidden: You can only access your own configuration'})
-
-        method = event.get('requestContext', {}).get('http', {}).get('method', event.get('httpMethod'))
         
         if method == 'GET':
             return get_config(app_id, user_id)

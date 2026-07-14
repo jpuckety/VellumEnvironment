@@ -11,9 +11,7 @@ import (
 	"time"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
-	"github.com/jpuckett/EmailMCP/emailmcp/internal/crypto"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/server"
-	"github.com/jpuckett/EmailMCP/emailmcp/internal/store"
 )
 
 func main() {
@@ -32,11 +30,6 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	if err := config.ValidateMasterKeyPresence(); err != nil {
-		logger.Error("startup failed", "error", err)
-		os.Exit(1)
-	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("failed to load config", "error", err)
@@ -50,16 +43,25 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	st, err := store.New(ctx, cfg.DBPath)
-	if err != nil {
-		logger.Error("failed to open store", "error", err, "path", cfg.DBPath)
+	// Resolve CONFIG_API_URL from SSM when not set in the environment.
+	cfg.FetchRemoteDefaults(ctx)
+
+	if cfg.ConfigAPIURL == "" {
+		logger.Error("CONFIG_API_URL is required (set env or ensure SSM parameter /emailmcp/config-api/url is available)")
 		os.Exit(1)
 	}
-	defer st.Close()
 
-	cryptoSvc := crypto.MustNewFromEnv()
+	logger.Info("config api configured; running startup health check", "url", cfg.ConfigAPIURL)
+	healthClient := config.NewClient(cfg.ConfigAPIURL, cfg.ApplicationID)
+	if err := healthClient.EnsureHealthy(ctx, logger); err != nil {
+		logger.Error("config api health check failed; refusing to start",
+			"error", err,
+			"url", cfg.ConfigAPIURL,
+		)
+		os.Exit(1)
+	}
 
-	srv, err := server.New(ctx, st, cryptoSvc, cfg)
+	srv, err := server.New(ctx, cfg)
 	if err != nil {
 		logger.Error("failed to create mcp server", "error", err)
 		os.Exit(1)
@@ -95,7 +97,6 @@ func main() {
 		}()
 
 		logger.Info("EmailMCP server starting", "addr", cfg.ListenAddr, "transport", "http")
-		logger.Info("Use EMAILMCP_MASTER_KEY for encryption (32-byte base64)")
 
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)

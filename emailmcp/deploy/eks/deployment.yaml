@@ -26,12 +26,6 @@ spec:
             name: emailmcp-config
         - secretRef:
             name: emailmcp-secrets
-        volumeMounts:
-        - name: data
-          mountPath: /data
-      volumes:
-      - name: data
-        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

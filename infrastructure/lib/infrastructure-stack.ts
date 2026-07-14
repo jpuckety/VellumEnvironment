@@ -7,6 +7,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cloudtrail from 'aws-cdk-lib/aws-cloudtrail';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as path from 'path';
 
 export class InfrastructureStack extends cdk.Stack {
@@ -35,7 +36,7 @@ export class InfrastructureStack extends cdk.Stack {
     const googleClientId = this.node.tryGetContext('googleClientId');
 
     const configApiLambda = new lambda.Function(this, 'EmailMCPConfigApi', {
-      runtime: lambda.Runtime.PYTHON_3_12,
+      runtime: new lambda.Runtime('python3.14', lambda.RuntimeFamily.PYTHON),
       handler: 'main.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../../emailmcp-config-api/dist')),
       timeout: cdk.Duration.seconds(30),
@@ -103,7 +104,33 @@ export class InfrastructureStack extends cdk.Stack {
           "sts:AssumeRoleWithWebIdentity"
         ),
       });
-      functionUrl.grantInvokeUrl(irsaRole);
+
+      // Identity-based permissions for Function URL invoke.
+      // Include both the bare function ARN and qualified ARN (name:*) — Function
+      // URL IAM auth has been observed to require the qualified form.
+      irsaRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['lambda:InvokeFunctionUrl', 'lambda:InvokeFunction'],
+        resources: [
+          configApiLambda.functionArn,
+          `${configApiLambda.functionArn}:*`,
+        ],
+      }));
+
+      // Resource-based permission on the function is required for Function URL
+      // AWS_IAM auth. grantInvokeUrl only adds an identity policy for IAM roles
+      // in the same account, which is not sufficient for Function URLs and
+      // results in 403 Forbidden at the URL auth layer.
+      configApiLambda.addPermission('AllowIRSAInvokeFunctionUrl', {
+        principal: irsaRole,
+        action: 'lambda:InvokeFunctionUrl',
+        functionUrlAuthType: lambda.FunctionUrlAuthType.AWS_IAM,
+      });
+
+      // Grant permission to read the SSM parameter
+      irsaRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['ssm:GetParameter'],
+        resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/emailmcp/config-api/url`],
+      }));
       
       new cdk.CfnOutput(this, 'IrsaRoleArn', {
         value: irsaRole.roleArn,
@@ -119,6 +146,13 @@ export class InfrastructureStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'ConfigApiUrl', {
       value: functionUrl.url,
+    });
+
+    // 11. SSM Parameter for the URL (Way to inform other services)
+    new ssm.StringParameter(this, 'ConfigApiUrlParam', {
+      parameterName: '/emailmcp/config-api/url',
+      stringValue: functionUrl.url,
+      description: 'The URL of the EmailMCP Config API Lambda',
     });
 
     // 9. ECR Repository for the Go MCP Server

@@ -8,11 +8,8 @@ services:
     env_file: emailmcp/.env
     environment:
       - EMAILMCP_LISTEN_ADDR=:8080
-      - EMAILMCP_DB_PATH=/data/emailmcp.db
     ports:
       - "8080:8080"
-    volumes:
-      - emailmcp-data:/data
 
   vellum-assistant:
     image: vellumai/vellum-assistant:latest
@@ -24,6 +21,3 @@ services:
       - "8000:8000"
     depends_on:
       - emailmcp
-
-volumes:
-  emailmcp-data:

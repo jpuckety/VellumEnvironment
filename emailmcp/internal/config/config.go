@@ -1,19 +1,21 @@
 package config
 
 import (
-	"fmt"
+	"context"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
 // Config holds application configuration.
 type Config struct {
 	// Server
 	ListenAddr string
-	// DB
-	DBPath string
-	// Crypto master key is loaded via crypto package from EMAILMCP_MASTER_KEY
 
 	// IMAP pool settings
 	IMAPMaxConnsPerAccount int
@@ -28,17 +30,22 @@ type Config struct {
 	// Transport
 	Transport string // "http" or "stdio"
 
-	// Auth & Hybrid Storage
+	// Auth & remote account storage (Config API)
 	ApplicationID  string
 	ConfigAPIURL   string
 	GoogleClientID string
+	// GoogleClientSecret is required for HTTP mode OAuth (authorization code
+	// exchange with Google). Not used for ID-token verification itself.
+	GoogleClientSecret string
+	// PublicBaseURL is the externally reachable origin of this server
+	// (e.g. https://emailmcp.ecg.co). Used for OAuth metadata and redirect URIs.
+	PublicBaseURL string
 }
 
 // Load reads configuration from environment with sensible defaults.
 func Load() (*Config, error) {
 	cfg := &Config{
 		ListenAddr:             getEnv("EMAILMCP_LISTEN_ADDR", ":8080"),
-		DBPath:                 getEnv("EMAILMCP_DB_PATH", "./emailmcp.db"),
 		IMAPMaxConnsPerAccount: getEnvInt("EMAILMCP_IMAP_MAX_CONNS", 4),
 		IMAPConnIdleTimeout:    getEnvDuration("EMAILMCP_IMAP_IDLE_TIMEOUT", 5*time.Minute),
 		SMTPDefaultTimeout:     getEnvDuration("EMAILMCP_SMTP_TIMEOUT", 30*time.Second),
@@ -47,6 +54,8 @@ func Load() (*Config, error) {
 		ApplicationID:          getEnv("APPLICATION_ID", "default"),
 		ConfigAPIURL:           getEnv("CONFIG_API_URL", ""),
 		GoogleClientID:         getEnv("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret:     getEnv("GOOGLE_CLIENT_SECRET", ""),
+		PublicBaseURL:          strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/"),
 	}
 
 	if cfg.IMAPMaxConnsPerAccount < 1 {
@@ -54,6 +63,32 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// FetchRemoteDefaults attempts to load missing configuration from AWS SSM if available.
+func (c *Config) FetchRemoteDefaults(ctx context.Context) {
+	if c.ConfigAPIURL != "" {
+		return
+	}
+
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		return
+	}
+
+	// Load AWS config
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		return
+	}
+
+	client := ssm.NewFromConfig(cfg)
+	out, err := client.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: aws.String("/emailmcp/config-api/url"),
+	})
+	if err == nil && out.Parameter != nil && out.Parameter.Value != nil {
+		c.ConfigAPIURL = *out.Parameter.Value
+	}
 }
 
 func getEnv(key, def string) string {
@@ -79,12 +114,4 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
-}
-
-// ValidateMasterKeyPresence is a helper that can be called at startup.
-func ValidateMasterKeyPresence() error {
-	if os.Getenv("EMAILMCP_MASTER_KEY") == "" {
-		return fmt.Errorf("EMAILMCP_MASTER_KEY is required for credential encryption")
-	}
-	return nil
 }

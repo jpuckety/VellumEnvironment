@@ -31,10 +31,28 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 # Ensure mandatory environment variables are set
-if [[ -z "${EMAILMCP_MASTER_KEY:-}" ]]; then
-  log_error "EMAILMCP_MASTER_KEY is not set."
+if [[ -z "${CONFIG_API_URL:-}" ]]; then
+  log_error "CONFIG_API_URL is not set."
   log_info "Please check $CONFIG_FILE or set it in your environment."
   exit 1
+fi
+if [[ -z "${GOOGLE_CLIENT_ID:-}" ]]; then
+  log_error "GOOGLE_CLIENT_ID is not set."
+  log_info "Please check $CONFIG_FILE or set it in your environment."
+  exit 1
+fi
+# HTTP mode (default) needs OAuth proxy credentials; stdio does not.
+if [[ "${EMAILMCP_TRANSPORT:-http}" == "http" ]]; then
+  if [[ -z "${GOOGLE_CLIENT_SECRET:-}" ]]; then
+    log_error "GOOGLE_CLIENT_SECRET is not set (required for HTTP MCP OAuth)."
+    log_info "Please check $CONFIG_FILE or set it in your environment."
+    exit 1
+  fi
+  if [[ -z "${PUBLIC_BASE_URL:-}" ]]; then
+    log_error "PUBLIC_BASE_URL is not set (required for HTTP MCP OAuth)."
+    log_info "Example: PUBLIC_BASE_URL=https://emailmcp.ecg.co"
+    exit 1
+  fi
 fi
 
 # Check if binary exists

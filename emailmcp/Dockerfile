@@ -24,8 +24,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o
 FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates tzdata && \
-    adduser -D -g '' emailmcp && \
-    mkdir /data && chown emailmcp:emailmcp /data
+    adduser -D -g '' emailmcp
 
 WORKDIR /app
 
@@ -34,8 +33,7 @@ COPY --from=builder /emailmcp /app/emailmcp
 USER emailmcp
 
 # Default envs (override at runtime)
-ENV EMAILMCP_LISTEN_ADDR=:8080 \
-    EMAILMCP_DB_PATH=/data/emailmcp.db
+ENV EMAILMCP_LISTEN_ADDR=:8080
 
 EXPOSE 8080
 

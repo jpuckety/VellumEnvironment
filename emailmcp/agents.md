@@ -1,26 +1,24 @@
 # EmailMCP - AI Agent Guidelines
 
 ## Project Overview
-EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) email capabilities to AI agents via the Model Context Protocol using Streamable HTTP.
+EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) email capabilities to AI agents via the Model Context Protocol using Streamable HTTP. Account configuration is stored remotely via the Config API (DynamoDB + Secrets Manager); there is no local database.
 
 ## Core Principles
-- Security first: All credentials must be encrypted at rest using AES-256-GCM. Never log decrypted secrets.
+- Security first: Never log credentials or email bodies. Passwords live in AWS Secrets Manager and are fetched per-request via the Config API.
 - Concurrency matters: IMAP connection pooling and SMTP client management must be efficient and safe.
 - Keep it idiomatic: Write clean, simple Go. Prefer standard library solutions when reasonable.
 - MCP tools should be reliable and well-described — they become the agent's capabilities.
 
 ## Security Rules (Non-Negotiable)
 - Never log passwords, decrypted credentials, or sensitive email content.
-- All new account-related code must go through the encryption service.
-- Master encryption key is only read from the `EMAILMCP_MASTER_KEY` environment variable.
-- When adding new fields that might be sensitive, default to encrypting them.
+- Credentials are never persisted by the EmailMCP process; they are loaded from the Config API for the lifetime of a request/connection.
+- HTTP request/response logging redacts `Authorization`, `Cookie`, and `Proxy-Authorization`.
 
 ## Architecture Overview
-- `internal/crypto` — AES-256-GCM encryption/decryption service
-- `internal/store` — Account persistence (SQLite)
+- `internal/config` — Env config + Config API client (SigV4 + Google bearer token)
 - `internal/imap` — IMAP connection pool and operations
 - `internal/smtp` — SMTP client management and sending logic
-- `internal/server` — MCP server setup and tool registration
+- `internal/server` — MCP server setup, Google auth middleware, tool registration
 - `cmd/emailmcp` — Application entrypoint
 
 ## Coding Standards
@@ -51,25 +49,27 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 - Attachments arrive base64-encoded in tool input; decode only when sending.
 
 ## Testing & Quality
-- Write tests for the encryption service and connection pool logic.
+- Write tests for the Config API client and connection pool logic.
 - Use table-driven tests where appropriate.
 - Run `go test ./...` and `go vet ./...` before considering changes complete.
 - Ensure `go build ./...` succeeds.
 
 ## Project-Specific Patterns
-- Accounts always require both IMAP and SMTP configuration on creation.
-- All IMAP/SMTP operations take a full `*types.Account` (with encrypted fields) and decrypt inside the service.
-- The crypto service is the single source of truth for encrypt/decrypt.
-- When modifying account fields, make sure both store and crypto paths are updated.
-- The main server uses Streamable HTTP exclusively (`mcp.NewStreamableHTTPHandler`).
+- One email account config per authenticated Google user (keyed by `sub`).
+- Account CRUD goes through `config.Client` (GET/PUT/DELETE Config API).
+- All IMAP/SMTP operations take a full `*types.Account` with plaintext passwords from the Config API.
+- HTTP MCP traffic requires a Google ID token (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`, and `CONFIG_API_URL` required at startup for HTTP mode).
+- MCP OAuth lives in `internal/server/oauth.go`: protected-resource + AS metadata, DCR, authorize → Google, callback, token (ID token as access_token).
+- The main server uses Streamable HTTP (`mcp.NewStreamableHTTPHandler`).
 
 ## GoLand Specific
 - The project uses standard Go modules. GoLand should resolve dependencies cleanly.
-- Run configurations should use environment variables for `EMAILMCP_MASTER_KEY`.
+- Run configurations should set `CONFIG_API_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `PUBLIC_BASE_URL` for HTTP mode.
 
 ## Common Pitfalls to Avoid
-- Storing plaintext passwords in structs that get logged or serialized.
+- Logging plaintext passwords or serializing them into MCP responses.
 - Creating long-lived IMAP connections outside the pool manager.
 - Assuming folder selection state persists across pool acquires.
 - Forgetting to close or properly release connections on error paths.
 - Using sequence numbers instead of UIDs for operations across sessions.
+- Falling back to any local database or file for account storage.

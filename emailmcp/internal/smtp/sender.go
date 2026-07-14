@@ -12,7 +12,6 @@ import (
 
 	emailpkg "github.com/jordan-wright/email"
 
-	"github.com/jpuckett/EmailMCP/emailmcp/internal/crypto"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
@@ -24,19 +23,18 @@ type Config struct {
 
 // Sender manages SMTP operations.
 type Sender struct {
-	crypto *crypto.Service
-	cfg    Config
+	cfg Config
 }
 
 // NewSender creates a new SMTP sender.
-func NewSender(c *crypto.Service, cfg Config) *Sender {
+func NewSender(cfg Config) *Sender {
 	if cfg.DefaultTimeout <= 0 {
 		cfg.DefaultTimeout = 30 * time.Second
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Sender{crypto: c, cfg: cfg}
+	return &Sender{cfg: cfg}
 }
 
 // SendEmail sends an email using the specified account's SMTP settings.
@@ -47,11 +45,10 @@ func (s *Sender) SendEmail(ctx context.Context, acc *types.Account, input types.
 
 	smtpPass := acc.SMTPPassword
 	if smtpPass == "" {
-		var err error
-		smtpPass, err = s.crypto.DecryptString(acc.SMTPPasswordEnc)
-		if err != nil {
-			return fmt.Errorf("decrypt smtp password: %w", err)
-		}
+		smtpPass = acc.IMAPPassword
+	}
+	if smtpPass == "" {
+		return errors.New("smtp password is required")
 	}
 
 	from := input.From

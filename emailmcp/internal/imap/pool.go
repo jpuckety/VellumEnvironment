@@ -11,7 +11,6 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 
-	"github.com/jpuckett/EmailMCP/emailmcp/internal/crypto"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
@@ -29,8 +28,7 @@ type Config struct {
 
 // Manager manages per-account IMAP connection pools.
 type Manager struct {
-	crypto *crypto.Service
-	cfg    Config
+	cfg Config
 
 	mu    sync.Mutex
 	pools map[string]*accountPool
@@ -65,7 +63,7 @@ type imapAccountConfig struct {
 }
 
 // NewManager creates an IMAP connection manager.
-func NewManager(cryptoSvc *crypto.Service, cfg Config) *Manager {
+func NewManager(cfg Config) *Manager {
 	if cfg.MaxConnsPerAccount <= 0 {
 		cfg.MaxConnsPerAccount = defaultMaxConns
 	}
@@ -76,9 +74,8 @@ func NewManager(cryptoSvc *crypto.Service, cfg Config) *Manager {
 		cfg.Logger = slog.Default()
 	}
 	return &Manager{
-		crypto: cryptoSvc,
-		cfg:    cfg,
-		pools:  make(map[string]*accountPool),
+		cfg:   cfg,
+		pools: make(map[string]*accountPool),
 	}
 }
 
@@ -94,15 +91,8 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 	logger := m.cfg.Logger.With("op", "get_or_create_pool", "account_id", acc.ID)
 	logger.Debug("creating new imap pool", "host", acc.IMAPHost, "port", acc.IMAPPort, "use_tls", acc.IMAPUseTLS)
 
-	// Decrypt credentials (only while creating initial config)
-	imapPass := acc.IMAPPassword
-	if imapPass == "" {
-		var err error
-		imapPass, err = m.crypto.DecryptString(acc.IMAPPasswordEnc)
-		if err != nil {
-			logger.Error("failed to decrypt imap password", "error", err)
-			return nil, fmt.Errorf("decrypt imap password: %w", err)
-		}
+	if acc.IMAPPassword == "" {
+		return nil, errors.New("imap password is required")
 	}
 
 	p := &accountPool{
@@ -111,7 +101,7 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 			Host:     acc.IMAPHost,
 			Port:     acc.IMAPPort,
 			Username: acc.IMAPUsername,
-			Password: imapPass,
+			Password: acc.IMAPPassword,
 			UseTLS:   acc.IMAPUseTLS,
 		},
 		maxConns: m.cfg.MaxConnsPerAccount,

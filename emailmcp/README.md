@@ -5,7 +5,7 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 ## Features
 
 ### IMAP (Inbound)
-- Secure AES-256-GCM encrypted credential storage (Standalone) or AWS Secrets Manager (Cloud)
+- Credentials loaded from AWS Secrets Manager via the Config API
 - Robust per-account IMAP connection pooling with health checks and limits
 - List folders
 - Search emails (text, from, since, etc.)
@@ -13,8 +13,8 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 - Move, flag, and delete (single and bulk)
 
 ### Multi-User & Cloud Architecture
-- **Google OAuth2 Authentication**: Secure multi-user isolation using Google ID tokens.
-- **Hybrid Storage Model**: General configuration in Amazon DynamoDB and sensitive credentials in AWS Secrets Manager.
+- **Google OAuth2 Authentication**: MCP OAuth 2.1 discovery + authorization-code flow that fronts Google sign-in; Google ID tokens authorize MCP traffic.
+- **Remote Storage**: Account configuration in Amazon DynamoDB and sensitive credentials in AWS Secrets Manager.
 - **AWS CDK Infrastructure**: Fully automated resource provisioning using TypeScript.
 - **Config API Layer**: Lightweight Python Lambda gateway for configuration management.
 
@@ -23,11 +23,10 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 - Attachments (base64 in tool calls)
 - Per-account SMTP configuration with TLS support
 
-### Multi-Account & Security
-- Unified account model for IMAP + SMTP
-- All operations scoped by `account_id`
-- Master key from `EMAILMCP_MASTER_KEY` (never logged)
-- Pure Go SQLite storage
+### Multi-User Security
+- One email account config per authenticated Google user
+- Google ID token required on MCP HTTP traffic
+- No local database or master encryption key
 
 ## Requirements
 
@@ -35,7 +34,8 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 - Node.js & npm (for CDK infrastructure)
 - Python 3.12 (for Config API Lambda)
 - AWS CLI configured with appropriate credentials
-- A 32-byte base64 master encryption key (for standalone mode)
+- Google OAuth2 Client ID
+- Config API URL (from CDK deploy, or resolvable via SSM)
 
 ## Quick Start (Cloud Deployment)
 
@@ -52,7 +52,7 @@ The cloud deployment provisions a multi-user environment using AWS CDK.
 
 The `run.sh` script automates building the Go binary, packaging the Lambda, and deploying the CDK stack. After deployment, note the `ConfigApiUrl` output for your MCP server configuration.
 
-## Standalone Quick Start
+## Local Quick Start
 
 ```bash
 # 1. Clone and build
@@ -61,19 +61,16 @@ cd EmailMCP/emailmcp
 go mod tidy
 go build -o emailmcp ./cmd/emailmcp
 
-# 2. Generate master key
-openssl rand -base64 32
-# Copy the output
-
-# 3. Configure
+# 2. Configure
 cp .env.example .env
-# Edit .env and set EMAILMCP_MASTER_KEY
+# Edit .env and set CONFIG_API_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+# and PUBLIC_BASE_URL (CONFIG_API_URL can also be resolved from SSM)
 
-# 4. Run
+# 3. Run
 ./run.sh run
 ```
 
-The server listens on `:8080` by default and serves the Streamable HTTP transport at `/`.
+The server listens on `:8080` by default and serves the Streamable HTTP transport at `/`. Startup refuses to serve if the Config API health check fails.
 
 ### Installation (System-wide)
 
@@ -91,8 +88,11 @@ The wrapper script automatically loads configuration from `~/.emailmcp`. You sho
 
 ```bash
 # Example ~/.emailmcp
-EMAILMCP_MASTER_KEY=your-32-byte-base64-key
-EMAILMCP_DB_PATH=/Users/youruser/.emailmcp.db
+CONFIG_API_URL=https://your-config-api.lambda-url.region.on.aws/
+GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+PUBLIC_BASE_URL=https://emailmcp.ecg.co
+APPLICATION_ID=default
 ```
 
 ### Cloud Deployment Configuration
@@ -101,6 +101,8 @@ When deploying to AWS, the following environment variables can be set in `emailm
 
 - `AWS_REGION`: The AWS region to deploy the infrastructure to (defaults to your AWS CLI configuration).
 - `GOOGLE_CLIENT_ID`: Your Google OAuth2 Client ID for user authentication.
+- `GOOGLE_CLIENT_SECRET`: Google OAuth client secret (HTTP/MCP OAuth flow).
+- `PUBLIC_BASE_URL`: Public origin of the MCP server (default for EKS: `https://emailmcp.ecg.co`).
 - `EKS_OIDC_PROVIDER_ARN`: (EKS Mode) The ARN of your cluster's IAM OIDC provider. If not set, the script will attempt to detect it from the current kubectl context.
 - `EKS_CERTIFICATE_ARN`: (EKS Mode) The ARN of the SSL certificate for the ALB Ingress. If not set, the script will attempt to retrieve it from the CDK outputs.
 
@@ -116,24 +118,24 @@ To remove the deployment from EKS:
 
 ## MCP Tools
 
-| Tool                  | Description                              |
-|-----------------------|------------------------------------------|
-| `add_email_account`   | Add IMAP + SMTP account (creds encrypted)|
-| `list_email_accounts` | List accounts (no secrets)               |
-| `remove_email_account`| Delete account                           |
-| `list_folders`        | List IMAP mailboxes                      |
-| `search_emails`       | Search folder (summaries)                |
-| `read_email`          | Fetch full message by UID                |
-| `move_emails`         | Bulk move UIDs                           |
-| `flag_emails`         | Add/remove flags                         |
-| `delete_emails`       | Mark emails deleted                      |
-| `send_email`          | Send message (text/HTML + attachments)   |
+| Tool                  | Description                                              |
+|-----------------------|----------------------------------------------------------|
+| `add_email_account`   | Create/replace the user's IMAP + SMTP account (Config API)|
+| `list_email_accounts` | List the user's account (no secrets)                     |
+| `remove_email_account`| Delete the user's account config                         |
+| `list_folders`        | List IMAP mailboxes                                      |
+| `search_emails`       | Search folder (summaries)                                |
+| `read_email`          | Fetch full message by UID                                |
+| `move_emails`         | Bulk move UIDs                                           |
+| `flag_emails`         | Add/remove flags                                         |
+| `delete_emails`       | Mark emails deleted                                      |
+| `send_email`          | Send message (text/HTML + attachments)                   |
 
-All email tools require `account_id`.
+Account tools operate on the authenticated user's single config (keyed by Google `sub`).
 
 ## Configuration
 
-EmailMCP can run in two modes: **Standalone** (local SQLite) or **Cloud** (DynamoDB + Secrets Manager).
+EmailMCP uses **remote account storage only** (Config API → DynamoDB + Secrets Manager).
 
 ### Cloud Deployment Variables
 
@@ -147,25 +149,16 @@ When deploying the infrastructure, you must provide the following CDK context:
 
 See `.env.example`. Key variables for the MCP server:
 
-#### Global Variables
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `EMAILMCP_MASTER_KEY` | Yes | 32-byte base64 key for local credential encryption. |
+| `CONFIG_API_URL` | Yes* | Config API Function URL. *May be resolved from SSM `/emailmcp/config-api/url`. |
+| `GOOGLE_CLIENT_ID` | Yes | Google OAuth2 Client ID for ID token verification. |
+| `GOOGLE_CLIENT_SECRET` | Yes (HTTP) | Google client secret for the MCP OAuth authorize/token proxy. |
+| `PUBLIC_BASE_URL` | Yes (HTTP) | Public origin (issuer + OAuth redirect base), e.g. `https://emailmcp.ecg.co`. |
+| `APPLICATION_ID` | No | Application partition key (default: `default`). |
 | `EMAILMCP_LOG_LEVEL` | No | `debug`, `info` (default), `warn`, `error`. |
 | `EMAILMCP_TRANSPORT` | No | `http` (default) or `stdio`. |
-
-#### Cloud Mode Variables
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `CONFIG_API_URL` | Yes | The URL from the CDK deployment output. |
-| `GOOGLE_CLIENT_ID` | Yes | The same Google Client ID used in deployment. |
-| `APPLICATION_ID` | No | Unique ID for your application (default: `default`). |
-
-#### Standalone Mode Variables
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `EMAILMCP_DB_PATH` | No | Path to SQLite database (default: `./emailmcp.db`). |
-| `EMAILMCP_LISTEN_ADDR`| No | HTTP listen address (default: `:8080`). |
+| `EMAILMCP_LISTEN_ADDR` | No | HTTP listen address (default: `:8080`). |
 
 ### IMAP & SMTP Tuning
 - `EMAILMCP_IMAP_MAX_CONNS`: Max connections per account (default: 4).
@@ -176,8 +169,16 @@ See `.env.example`. Key variables for the MCP server:
 
 ```bash
 docker build -t emailmcp .
-docker run -e EMAILMCP_MASTER_KEY=... -p 8080:8080 emailmcp
+docker run \
+  -e CONFIG_API_URL=... \
+  -e GOOGLE_CLIENT_ID=... \
+  -e GOOGLE_CLIENT_SECRET=... \
+  -e PUBLIC_BASE_URL=https://emailmcp.ecg.co \
+  -e AWS_REGION=us-east-1 \
+  -p 8080:8080 emailmcp
 ```
+
+The container needs AWS credentials (or IRSA on EKS) to call the Config API Function URL with SigV4.
 
 ## EKS Deployment
 
@@ -195,7 +196,7 @@ EmailMCP can be deployed to Amazon EKS using the provided Kubernetes manifests a
 
 ### Deployment Steps
 
-1.  **Set Environment Variables**: Ensure `EMAILMCP_MASTER_KEY` and `GOOGLE_CLIENT_ID` are set in your environment or `.env` file.
+1.  **Set Environment Variables**: Ensure `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and optionally `PUBLIC_BASE_URL` are set in your environment or `.env` file. In Google Cloud Console, add authorized redirect URI `{PUBLIC_BASE_URL}/oauth/callback` (e.g. `https://emailmcp.ecg.co/oauth/callback`).
 2.  **Deploy to EKS**:
     ```bash
     ./run.sh eks-deploy
@@ -216,9 +217,7 @@ EmailMCP can be deployed to Amazon EKS using the provided Kubernetes manifests a
 4.  **Access the Server**:
     The service is exposed via an AWS Application Load Balancer (ALB) at `http://emailmcp.ecg.co`. Ensure your DNS or `/etc/hosts` points `emailmcp.ecg.co` to the ALB's external DNS name (found in `eks-status`).
 
-### Persistent Storage
-
-In EKS, the server uses an `emptyDir` for the `/data` directory by default. This means the local SQLite database is cleared when a pod restarts. In **Cloud Mode**, this is usually acceptable as account configurations are stored in DynamoDB and fetched dynamically. If you need persistence for the local SQLite database, you should modify `deploy/eks/deployment.yaml` to use a PersistentVolumeClaim.
+Account configuration is always remote (DynamoDB / Secrets Manager via Config API). The pod is stateless — no persistent volume is required for account data.
 
 ## Claude Desktop Integration
 
@@ -249,19 +248,21 @@ Otherwise, you can run it from your source directory (requires absolute paths):
       "command": "/absolute/path/to/EmailMCP/emailmcp",
       "args": ["-transport", "stdio"],
       "env": {
-        "EMAILMCP_MASTER_KEY": "your-32-byte-base64-key",
-        "EMAILMCP_DB_PATH": "/absolute/path/to/EmailMCP/emailmcp.db"
+        "CONFIG_API_URL": "https://your-config-api.lambda-url.region.on.aws/",
+        "GOOGLE_CLIENT_ID": "your-google-client-id.apps.googleusercontent.com"
       }
     }
   }
 }
 ```
 
+Note: HTTP mode with a Google ID token is the supported multi-user path. Stdio does not apply the HTTP auth middleware.
+
 ## Architecture
 
 ### System Diagram
 
-The following diagram illustrates the interaction between components in a **Cloud Deployment**, highlighting the user and service authentication flows.
+The following diagram illustrates the interaction between components, highlighting the user and service authentication flows.
 
 ```mermaid
 graph TD
@@ -274,21 +275,24 @@ graph TD
         EmailSvc[Email Provider <br/> IMAP/SMTP]
     end
 
-    subgraph "AWS Infrastructure (Cloud Mode)"
+    subgraph "AWS Infrastructure"
         MCP[EmailMCP Server <br/> Go]
         Lambda[Config API <br/> Python Lambda]
         DDB[(DynamoDB <br/> Metadata)]
         SM[Secrets Manager <br/> Credentials]
     end
 
-    Client -- "1. Google ID Token <br/> (User Auth) <br/> <b>Sample:</b> eyJhbGci..." --> MCP
-    MCP -. "2. Validate Token" .-> Google
-    MCP -- "3. Get Config <br/> (Signed SigV4) <br/> <b>Sample:</b> GET /configs/app1/user123" --> Lambda
-    Lambda -. "4. Validate Token" .-> Google
-    Lambda -- "5. Query Metadata <br/> <b>Sample:</b> {imap_host: 'imap.gmail.com'}" --> DDB
-    Lambda -- "6. Fetch Secrets <br/> <b>Sample:</b> {password: 'secret_123'}" --> SM
-    Lambda -- "7. Return Config <br/> <b>Sample:</b> {imap_host: '...', password: '...'}" --> MCP
-    MCP -- "8. Authenticate & Ops <br/> (Service Auth) <br/> <b>Sample:</b> IMAP LOGIN alice@gmail.com ***" --> EmailSvc
+    Client -- "1. MCP OAuth (or Bearer ID token)" --> MCP
+    MCP -. "2. /oauth/authorize redirects user" .-> Google
+    Google -. "3. /oauth/callback + ID token" .-> MCP
+    Client -- "4. Bearer Google ID Token" --> MCP
+    MCP -. "5. Validate Token" .-> Google
+    MCP -- "6. Get Config (SigV4 + Google token)" --> Lambda
+    Lambda -. "7. Validate Token" .-> Google
+    Lambda -- "8. Query Metadata" --> DDB
+    Lambda -- "9. Fetch Secrets" --> SM
+    Lambda -- "10. Return Config" --> MCP
+    MCP -- "11. IMAP/SMTP ops" --> EmailSvc
 
     %% Styling
     classDef highlight fill:#f9f,stroke:#333,stroke-width:2px;
@@ -302,7 +306,7 @@ EmailMCP is ready for cloud-native deployment with the following components:
 - **Go MCP Server**: Validates Google ID tokens and dynamically fetches per-user configuration.
 - **Python Config API (AWS Lambda)**: Serves as a secure gateway between the MCP server and storage, protected by AWS IAM authentication.
 - **Hybrid Storage**:
-  - **DynamoDB**: Stores non-sensitive user metadata and IMAP server settings.
+  - **DynamoDB**: Stores non-sensitive user metadata and IMAP/SMTP server settings.
   - **Secrets Manager**: Securely stores IMAP passwords, indexed by `applicationId` and `userId`.
 - **AWS CDK**: Defines and provisions all resources including KMS keys for encryption, IAM roles for least-privilege access, and CloudTrail for audit logging.
 
@@ -314,12 +318,10 @@ For more details on the deployment process, see the root-level `run.sh` script a
 emailmcp/
   cmd/emailmcp          - Entry point
   internal/
-    crypto/             - AES-256-GCM service
-    store/              - SQLite account persistence
+    config/             - Env config + Config API client (SigV4)
     imap/               - Connection pool + operations (go-imap/v2)
     smtp/               - Sending logic (jordan-wright/email)
-    server/             - MCP server + tool registration
-    config/             - Env-based configuration
+    server/             - MCP server, Google auth, tool registration
     types/              - Shared domain types
 ```
 
@@ -333,11 +335,7 @@ go build ./...
 
 ## Security Notes
 
-- Never log decrypted credentials or full email bodies in production.
-- Master key must be provided via environment only.
+- Never log credentials or full email bodies in production.
+- Account secrets live only in Secrets Manager; EmailMCP does not persist them.
 - Use TLS for IMAP/SMTP in production.
-- Consider running behind a reverse proxy with auth if exposing publicly.
-
-## License
-
-MIT
+- Consider running behind a reverse proxy if exposing publicly; MCP routes already require Google ID tokens.

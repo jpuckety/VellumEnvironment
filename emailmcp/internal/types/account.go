@@ -3,6 +3,8 @@ package types
 import "time"
 
 // Account represents a unified email account supporting both IMAP and SMTP.
+// Credentials are loaded from the Config API (Secrets Manager) as plaintext
+// for the lifetime of a request — never logged or persisted by EmailMCP.
 type Account struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -13,31 +15,20 @@ type Account struct {
 	IMAPHost     string `json:"imap_host"`
 	IMAPPort     int    `json:"imap_port"`
 	IMAPUsername string `json:"imap_username"`
-	// IMAPPassword is used when fetching from the Config API (plaintext).
+	// IMAPPassword comes from the Config API (JSON field "password").
 	IMAPPassword string `json:"password,omitempty"`
-	// IMAPPasswordEnc is stored encrypted in the database.
-	IMAPPasswordEnc string `json:"-"`
-	IMAPUseTLS      bool   `json:"imap_use_tls"`
+	IMAPUseTLS   bool   `json:"imap_use_tls"`
 
 	// SMTP settings
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port"`
 	SMTPUsername string `json:"smtp_username"`
-	// SMTPPassword is used when fetching from the Config API (plaintext).
+	// SMTPPassword is optional; when empty, IMAPPassword is used.
 	SMTPPassword string `json:"smtp_password,omitempty"`
-	// SMTPPasswordEnc is stored encrypted in the database.
-	SMTPPasswordEnc string `json:"-"`
-	SMTPUseTLS      bool   `json:"smtp_use_tls"`
+	SMTPUseTLS   bool   `json:"smtp_use_tls"`
 
 	// Default sender address (optional). Falls back to SMTPUsername if empty.
 	FromAddress string `json:"from_address,omitempty"`
-}
-
-// DecryptedCredentials holds plaintext credentials after decryption.
-// Never persist or log these.
-type DecryptedCredentials struct {
-	IMAPPassword string
-	SMTPPassword string
 }
 
 // AccountSummary is a safe view without any credential material.

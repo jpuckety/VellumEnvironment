@@ -13,30 +13,30 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
-	"github.com/jpuckett/EmailMCP/emailmcp/internal/crypto"
 	imapmgr "github.com/jpuckett/EmailMCP/emailmcp/internal/imap"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/smtp"
-	"github.com/jpuckett/EmailMCP/emailmcp/internal/store"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
 // Server wraps the MCP server and dependencies.
 type Server struct {
 	mcpServer     *mcp.Server
-	store         *store.Store
 	imapMgr       *imapmgr.Manager
 	smtpSend      *smtp.Sender
-	crypto        *crypto.Service
 	logger        *slog.Logger
 	cfg           *config.Config
 	authenticator *Authenticator
+	oauth         *OAuthServer
 	configClient  *config.Client
 }
 
 // New creates and configures the EmailMCP server.
-func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *config.Config) (*Server, error) {
-	if err := config.ValidateMasterKeyPresence(); err != nil {
-		return nil, err
+func New(ctx context.Context, cfg *config.Config) (*Server, error) {
+	if cfg.ConfigAPIURL == "" {
+		return nil, errors.New("CONFIG_API_URL is required")
+	}
+	if cfg.GoogleClientID == "" {
+		return nil, errors.New("GOOGLE_CLIENT_ID is required")
 	}
 
 	imapCfg := imapmgr.Config{
@@ -45,8 +45,8 @@ func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *c
 		Logger:             slog.Default(),
 	}
 
-	imapMgr := imapmgr.NewManager(cryptoSvc, imapCfg)
-	smtpSender := smtp.NewSender(cryptoSvc, smtp.Config{
+	imapMgr := imapmgr.NewManager(imapCfg)
+	smtpSender := smtp.NewSender(smtp.Config{
 		DefaultTimeout: cfg.SMTPDefaultTimeout,
 		Logger:         slog.Default(),
 	})
@@ -56,33 +56,50 @@ func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *c
 		Version: "0.1.0",
 	}, nil)
 
-	var auth *Authenticator
-	if cfg.GoogleClientID != "" {
+	logger := slog.Default()
+
+	// OAuth (HTTP mode) needs a public base URL and Google client secret so MCP
+	// clients can complete the authorization code + PKCE flow via Google.
+	var oauth *OAuthServer
+	if cfg.Transport == "" || cfg.Transport == "http" {
+		if cfg.PublicBaseURL == "" {
+			return nil, errors.New("PUBLIC_BASE_URL is required for HTTP mode (e.g. https://emailmcp.ecg.co)")
+		}
+		if cfg.GoogleClientSecret == "" {
+			return nil, errors.New("GOOGLE_CLIENT_SECRET is required for HTTP mode OAuth")
+		}
 		var err error
-		auth, err = NewAuthenticator(ctx, cfg.GoogleClientID)
+		oauth, err = NewOAuthServer(cfg.PublicBaseURL, cfg.GoogleClientID, cfg.GoogleClientSecret, logger)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create authenticator: %w", err)
+			return nil, fmt.Errorf("failed to create oauth server: %w", err)
 		}
 	}
 
-	var configClient *config.Client
-	if cfg.ConfigAPIURL != "" {
-		configClient = config.NewClient(cfg.ConfigAPIURL, cfg.ApplicationID)
+	auth, err := NewAuthenticator(ctx, cfg.GoogleClientID, cfg.PublicBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create authenticator: %w", err)
 	}
+
+	configClient := config.NewClient(cfg.ConfigAPIURL, cfg.ApplicationID)
 
 	es := &Server{
 		mcpServer:     srv,
-		store:         st,
 		imapMgr:       imapMgr,
 		smtpSend:      smtpSender,
-		crypto:        cryptoSvc,
-		logger:        slog.Default(),
+		logger:        logger,
 		cfg:           cfg,
 		authenticator: auth,
+		oauth:         oauth,
 		configClient:  configClient,
 	}
 
 	es.logger.Info("initializing EmailMCP server", "name", "emailmcp", "version", "0.1.0")
+	if oauth != nil {
+		es.logger.Info("oauth authorization server enabled",
+			"issuer", cfg.PublicBaseURL,
+			"callback", cfg.PublicBaseURL+"/oauth/callback",
+		)
+	}
 	es.registerTools()
 	es.logger.Info("mcp server initialized")
 
@@ -90,7 +107,7 @@ func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *c
 }
 
 // HTTPHandler returns the Streamable HTTP handler wrapped with request/response logging and authentication.
-// It includes an unsecured /health endpoint for load balancer liveness probes.
+// It includes an unsecured /health endpoint for load balancer liveness probes and MCP OAuth endpoints.
 func (s *Server) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -100,17 +117,19 @@ func (s *Server) HTTPHandler() http.Handler {
 		w.Write([]byte("ok"))
 	})
 
+	// MCP OAuth discovery + authorize/token/register (unsecured).
+	if s.oauth != nil {
+		s.oauth.Mount(mux)
+	}
+
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 		return s.mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Logger: s.logger,
 	})
 
-	// MCP handler with authentication if enabled
-	var handler http.Handler = mcpHandler
-	if s.authenticator != nil {
-		handler = s.authenticator.Middleware(handler)
-	}
+	// MCP handler requires Google ID token authentication.
+	handler := s.authenticator.Middleware(mcpHandler)
 
 	// Register the MCP handler at the root.
 	mux.Handle("/", handler)
@@ -120,6 +139,8 @@ func (s *Server) HTTPHandler() http.Handler {
 }
 
 // ServeStdio runs the MCP server on the stdio transport.
+// Note: stdio has no HTTP auth middleware; tool handlers still require a user
+// context and will fail unless the transport is extended to supply tokens.
 func (s *Server) ServeStdio(ctx context.Context) error {
 	return s.mcpServer.Run(ctx, &mcp.StdioTransport{})
 }
@@ -210,20 +231,20 @@ func (r *statusRecorder) Flush() {
 }
 
 func (s *Server) registerTools() {
-	// Account management
+	// Account management (Config API)
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "add_email_account",
-		Description: "Add a new email account with IMAP and SMTP configuration. Credentials are stored encrypted.",
+		Description: "Create or replace the authenticated user's email account (IMAP + SMTP). Credentials are stored via the Config API (DynamoDB + Secrets Manager).",
 	}, s.addEmailAccount)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "list_email_accounts",
-		Description: "List all configured email accounts (without credentials).",
+		Description: "List the authenticated user's configured email account (without credentials).",
 	}, s.listEmailAccounts)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "remove_email_account",
-		Description: "Remove an email account by ID.",
+		Description: "Remove the authenticated user's email account configuration.",
 	}, s.removeEmailAccount)
 
 	// IMAP tools
@@ -271,28 +292,28 @@ type AddAccountInput struct {
 	IMAPHost     string `json:"imap_host"`
 	IMAPPort     int    `json:"imap_port" jsonschema:"default:993"`
 	IMAPUsername string `json:"imap_username"`
-	IMAPPassword string `json:"imap_password" jsonschema:"The IMAP password (will be encrypted at rest)"`
+	IMAPPassword string `json:"imap_password" jsonschema:"The IMAP password (stored in Secrets Manager)"`
 	IMAPUseTLS   bool   `json:"imap_use_tls" jsonschema:"default:true"`
 
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port" jsonschema:"default:587"`
 	SMTPUsername string `json:"smtp_username"`
-	SMTPPassword string `json:"smtp_password" jsonschema:"The SMTP password (will be encrypted at rest)"`
+	SMTPPassword string `json:"smtp_password" jsonschema:"The SMTP password; defaults to IMAP password when empty"`
 	SMTPUseTLS   bool   `json:"smtp_use_tls" jsonschema:"default:true"`
 
 	FromAddress string `json:"from_address,omitempty"`
 }
 
 type AccountIDInput struct {
-	AccountID string `json:"account_id" jsonschema:"The account ID"`
+	AccountID string `json:"account_id,omitempty" jsonschema:"Optional account ID; defaults to the authenticated user"`
 }
 
 type ListFoldersInput struct {
-	AccountID string `json:"account_id"`
+	AccountID string `json:"account_id,omitempty"`
 }
 
 type SearchEmailsInput struct {
-	AccountID string `json:"account_id"`
+	AccountID string `json:"account_id,omitempty"`
 	Folder    string `json:"folder,omitempty" jsonschema:"Folder to search, defaults to INBOX"`
 	Query     string `json:"query,omitempty" jsonschema:"Simple text search in subject/body"`
 	From      string `json:"from,omitempty"`
@@ -301,20 +322,20 @@ type SearchEmailsInput struct {
 }
 
 type ReadEmailInput struct {
-	AccountID string `json:"account_id"`
+	AccountID string `json:"account_id,omitempty"`
 	Folder    string `json:"folder,omitempty"`
 	UID       uint32 `json:"uid"`
 }
 
 type MoveEmailsInput struct {
-	AccountID  string   `json:"account_id"`
+	AccountID  string   `json:"account_id,omitempty"`
 	Folder     string   `json:"folder,omitempty"`
 	UIDs       []uint32 `json:"uids"`
 	DestFolder string   `json:"dest_folder"`
 }
 
 type FlagEmailsInput struct {
-	AccountID string   `json:"account_id"`
+	AccountID string   `json:"account_id,omitempty"`
 	Folder    string   `json:"folder,omitempty"`
 	UIDs      []uint32 `json:"uids"`
 	Flags     []string `json:"flags"`
@@ -322,13 +343,13 @@ type FlagEmailsInput struct {
 }
 
 type DeleteEmailsInput struct {
-	AccountID string   `json:"account_id"`
+	AccountID string   `json:"account_id,omitempty"`
 	Folder    string   `json:"folder,omitempty"`
 	UIDs      []uint32 `json:"uids"`
 }
 
 type SendEmailToolInput struct {
-	AccountID   string                  `json:"account_id"`
+	AccountID   string                  `json:"account_id,omitempty"`
 	To          []string                `json:"to"`
 	Cc          []string                `json:"cc,omitempty"`
 	Bcc         []string                `json:"bcc,omitempty"`
@@ -342,67 +363,102 @@ type SendEmailToolInput struct {
 // --- Handlers ---
 
 func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, in AddAccountInput) (*mcp.CallToolResult, any, error) {
+	user, token, err := s.requireAuth(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	if in.Name == "" || in.IMAPHost == "" || in.IMAPUsername == "" || in.SMTPHost == "" {
 		return nil, nil, errors.New("required fields missing: name, imap_host, imap_username, smtp_host")
 	}
+	if in.IMAPPassword == "" {
+		return nil, nil, errors.New("imap_password is required")
+	}
+
+	smtpUser := in.SMTPUsername
+	if smtpUser == "" {
+		smtpUser = in.IMAPUsername
+	}
+	smtpPass := in.SMTPPassword
+	if smtpPass == "" {
+		smtpPass = in.IMAPPassword
+	}
 
 	acc := &types.Account{
+		ID:           user.Subject,
 		Name:         in.Name,
 		IMAPHost:     in.IMAPHost,
 		IMAPPort:     defaultPort(in.IMAPPort, 993),
 		IMAPUsername: in.IMAPUsername,
+		IMAPPassword: in.IMAPPassword,
 		IMAPUseTLS:   defaultBool(in.IMAPUseTLS, true),
 		SMTPHost:     in.SMTPHost,
 		SMTPPort:     defaultPort(in.SMTPPort, 587),
-		SMTPUsername: in.SMTPUsername,
+		SMTPUsername: smtpUser,
+		SMTPPassword: smtpPass,
 		SMTPUseTLS:   defaultBool(in.SMTPUseTLS, true),
 		FromAddress:  in.FromAddress,
 	}
 
-	encIMAP, err := s.crypto.EncryptString(in.IMAPPassword)
-	if err != nil {
-		return nil, nil, fmt.Errorf("encrypt imap password: %w", err)
-	}
-	acc.IMAPPasswordEnc = encIMAP
-
-	encSMTP, err := s.crypto.EncryptString(in.SMTPPassword)
-	if err != nil {
-		return nil, nil, fmt.Errorf("encrypt smtp password: %w", err)
-	}
-	acc.SMTPPasswordEnc = encSMTP
-
-	if err := s.store.CreateAccount(ctx, acc); err != nil {
-		return nil, nil, fmt.Errorf("store account: %w", err)
+	if err := s.configClient.PutUserConfig(ctx, token, user.Subject, acc); err != nil {
+		return nil, nil, fmt.Errorf("store account via config api: %w", err)
 	}
 
 	s.logger.Info("account added", "id", acc.ID, "name", acc.Name)
 
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Account created successfully. ID: %s", acc.ID)}},
+		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Account saved successfully. ID: %s", acc.ID)}},
 	}, map[string]any{"id": acc.ID}, nil
 }
 
 func (s *Server) listEmailAccounts(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
-	accounts, err := s.store.ListAccounts(ctx)
+	user, token, err := s.requireAuth(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	return nil, map[string]any{"accounts": accounts}, nil
+
+	acc, err := s.configClient.GetUserConfig(ctx, token, user.Subject)
+	if err != nil {
+		if errors.Is(err, config.ErrConfigNotFound) {
+			return nil, map[string]any{"accounts": []types.AccountSummary{}}, nil
+		}
+		return nil, nil, err
+	}
+
+	summary := types.AccountSummary{
+		ID:          acc.ID,
+		Name:        acc.Name,
+		IMAPHost:    acc.IMAPHost,
+		IMAPPort:    acc.IMAPPort,
+		SMTPHost:    acc.SMTPHost,
+		SMTPPort:    acc.SMTPPort,
+		FromAddress: acc.FromAddress,
+		CreatedAt:   acc.CreatedAt,
+		UpdatedAt:   acc.UpdatedAt,
+	}
+	return nil, map[string]any{"accounts": []types.AccountSummary{summary}}, nil
 }
 
 func (s *Server) removeEmailAccount(ctx context.Context, req *mcp.CallToolRequest, in AccountIDInput) (*mcp.CallToolResult, any, error) {
-	if in.AccountID == "" {
-		return nil, nil, errors.New("account_id required")
-	}
-	if err := s.store.DeleteAccount(ctx, in.AccountID); err != nil {
+	user, token, err := s.requireAuth(ctx)
+	if err != nil {
 		return nil, nil, err
 	}
-	s.logger.Info("account removed", "id", in.AccountID)
+	if in.AccountID != "" && in.AccountID != user.Subject {
+		return nil, nil, fmt.Errorf("account_id does not match authenticated user")
+	}
+
+	if err := s.configClient.DeleteUserConfig(ctx, token, user.Subject); err != nil {
+		if errors.Is(err, config.ErrConfigNotFound) {
+			return nil, nil, errors.New("account not found")
+		}
+		return nil, nil, err
+	}
+	s.logger.Info("account removed", "id", user.Subject)
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Account removed"}}}, nil, nil
 }
 
 func (s *Server) listFolders(ctx context.Context, req *mcp.CallToolRequest, in ListFoldersInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx, in.AccountID)
+	acc, err := s.getAccount(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -414,7 +470,7 @@ func (s *Server) listFolders(ctx context.Context, req *mcp.CallToolRequest, in L
 }
 
 func (s *Server) searchEmails(ctx context.Context, req *mcp.CallToolRequest, in SearchEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx, in.AccountID)
+	acc, err := s.getAccount(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -446,7 +502,7 @@ func (s *Server) searchEmails(ctx context.Context, req *mcp.CallToolRequest, in 
 }
 
 func (s *Server) readEmail(ctx context.Context, req *mcp.CallToolRequest, in ReadEmailInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx, in.AccountID)
+	acc, err := s.getAccount(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -458,7 +514,7 @@ func (s *Server) readEmail(ctx context.Context, req *mcp.CallToolRequest, in Rea
 }
 
 func (s *Server) moveEmails(ctx context.Context, req *mcp.CallToolRequest, in MoveEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx, in.AccountID)
+	acc, err := s.getAccount(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -469,7 +525,7 @@ func (s *Server) moveEmails(ctx context.Context, req *mcp.CallToolRequest, in Mo
 }
 
 func (s *Server) flagEmails(ctx context.Context, req *mcp.CallToolRequest, in FlagEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx, in.AccountID)
+	acc, err := s.getAccount(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -484,7 +540,7 @@ func (s *Server) flagEmails(ctx context.Context, req *mcp.CallToolRequest, in Fl
 }
 
 func (s *Server) deleteEmails(ctx context.Context, req *mcp.CallToolRequest, in DeleteEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx, in.AccountID)
+	acc, err := s.getAccount(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -495,7 +551,7 @@ func (s *Server) deleteEmails(ctx context.Context, req *mcp.CallToolRequest, in 
 }
 
 func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in SendEmailToolInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx, in.AccountID)
+	acc, err := s.getAccount(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -519,31 +575,32 @@ func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in Sen
 
 // --- Helpers ---
 
-func (s *Server) getAccount(ctx context.Context, id string) (*types.Account, error) {
-	// If authenticated and config API is available, use it.
-	if userInfo, ok := UserFromContext(ctx); ok && s.configClient != nil {
-		token, _ := TokenFromContext(ctx)
-		s.logger.Debug("fetching config from API", "user", userInfo.Email, "sub", userInfo.Subject)
-		acc, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject)
-		if err != nil {
-			return nil, fmt.Errorf("fetch config from api: %w", err)
-		}
-		// Set an ID if missing
-		if acc.ID == "" {
-			acc.ID = userInfo.Subject
-		}
-		return acc, nil
+func (s *Server) requireAuth(ctx context.Context) (*UserInfo, string, error) {
+	userInfo, ok := UserFromContext(ctx)
+	if !ok {
+		return nil, "", errors.New("authentication required: provide a valid Google ID token")
+	}
+	token, ok := TokenFromContext(ctx)
+	if !ok || token == "" {
+		return nil, "", errors.New("authentication token required")
+	}
+	return userInfo, token, nil
+}
+
+// getAccount loads the authenticated user's account from the Config API.
+func (s *Server) getAccount(ctx context.Context) (*types.Account, error) {
+	userInfo, token, err := s.requireAuth(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	if id == "" {
-		return nil, errors.New("account_id is required")
-	}
-	acc, err := s.store.GetAccount(ctx, id)
+	s.logger.Debug("fetching config from API", "user", userInfo.Email, "sub", userInfo.Subject)
+	acc, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, fmt.Errorf("account not found: %s", id)
+		if errors.Is(err, config.ErrConfigNotFound) {
+			return nil, errors.New("no email account configured for this user; call add_email_account first")
 		}
-		return nil, err
+		return nil, fmt.Errorf("fetch config from api: %w", err)
 	}
 	return acc, nil
 }

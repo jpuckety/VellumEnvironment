@@ -6,3 +6,6 @@ node_modules
 # CDK asset staging directory
 .cdk.staging
 cdk.out
+
+# Local, env-specific CDK context (OIDC ARNs, account-bound values). Do not commit.
+cdk.local.json
