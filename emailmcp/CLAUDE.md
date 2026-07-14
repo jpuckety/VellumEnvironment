@@ -21,7 +21,7 @@ go build ./...                         # verify everything compiles
 # From repo root via run.sh
 ./run.sh setup         # copy .env.example → .env
 ./run.sh key           # generate a 32-byte base64 master key
-./run.sh build         # build native + Linux x86_64 binaries
+./run.sh build-push    # build and push Docker image to ECR
 ./run.sh run           # load .env and start the server
 ./run.sh run --transport stdio  # run in stdio MCP mode
 ./run.sh check         # test + vet + build

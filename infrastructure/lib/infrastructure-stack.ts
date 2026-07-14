@@ -5,6 +5,8 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cloudtrail from 'aws-cdk-lib/aws-cloudtrail';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as path from 'path';
 
 export class InfrastructureStack extends cdk.Stack {
@@ -30,6 +32,8 @@ export class InfrastructureStack extends cdk.Stack {
     });
 
     // 3. Lambda Function for Config API
+    const googleClientId = this.node.tryGetContext('googleClientId');
+
     const configApiLambda = new lambda.Function(this, 'EmailMCPConfigApi', {
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'main.handler',
@@ -39,6 +43,7 @@ export class InfrastructureStack extends cdk.Stack {
       environment: {
         TABLE_NAME: table.tableName,
         KMS_KEY_ARN: kmsKey.keyArn,
+        GOOGLE_CLIENT_ID: googleClientId || '',
       },
     });
 
@@ -61,7 +66,7 @@ export class InfrastructureStack extends cdk.Stack {
 
     // 5. Lambda Function URL
     const functionUrl = configApiLambda.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,
+      authType: lambda.FunctionUrlAuthType.AWS_IAM,
       cors: {
         allowedOrigins: ['*'],
         allowedMethods: [lambda.HttpMethod.ALL],
@@ -69,7 +74,43 @@ export class InfrastructureStack extends cdk.Stack {
       },
     });
 
-    // 6. Audit Logging (CloudTrail)
+    // 6. IRSA Role for EKS (Preferred)
+    const eksOidcProvider = this.node.tryGetContext('eksOidcProvider');
+    const eksOidcProviderArn = this.node.tryGetContext('eksOidcProviderArn');
+
+    if (eksOidcProvider || eksOidcProviderArn) {
+      let providerArn: string;
+      let oidcProviderClean: string;
+
+      if (eksOidcProviderArn) {
+        providerArn = eksOidcProviderArn;
+        // Extract provider name from ARN (everything after 'oidc-provider/')
+        oidcProviderClean = eksOidcProviderArn.split('oidc-provider/')[1];
+      } else {
+        oidcProviderClean = eksOidcProvider.replace('https://', '');
+        providerArn = `arn:aws:iam::${this.account}:oidc-provider/${oidcProviderClean}`;
+      }
+
+      const irsaRole = new iam.Role(this, 'EmailMCPIRSARole', {
+        assumedBy: new iam.FederatedPrincipal(
+          providerArn,
+          {
+            "StringEquals": {
+              [`${oidcProviderClean}:sub`]: "system:serviceaccount:emailmcp:emailmcp",
+              [`${oidcProviderClean}:aud`]: "sts.amazonaws.com",
+            },
+          },
+          "sts:AssumeRoleWithWebIdentity"
+        ),
+      });
+      functionUrl.grantInvokeUrl(irsaRole);
+      
+      new cdk.CfnOutput(this, 'IrsaRoleArn', {
+        value: irsaRole.roleArn,
+      });
+    }
+
+    // 8. Audit Logging (CloudTrail)
     const trail = new cloudtrail.Trail(this, 'EmailMCPAuditTrail', {
       managementEvents: cloudtrail.ReadWriteType.ALL,
     });
@@ -78,6 +119,27 @@ export class InfrastructureStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'ConfigApiUrl', {
       value: functionUrl.url,
+    });
+
+    // 9. ECR Repository for the Go MCP Server
+    const repository = new ecr.Repository(this, 'EmailMCPRepository', {
+      repositoryName: 'emailmcp',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteImages: true,
+    });
+
+    new cdk.CfnOutput(this, 'EcrRepositoryUri', {
+      value: repository.repositoryUri,
+    });
+
+    // 10. Certificate for EKS Ingress
+    const certificate = new acm.Certificate(this, 'EmailMCPCertificate', {
+      domainName: 'emailmcp.ecg.co',
+      validation: acm.CertificateValidation.fromDns(),
+    });
+
+    new cdk.CfnOutput(this, 'CertificateArn', {
+      value: certificate.certificateArn,
     });
   }
 }

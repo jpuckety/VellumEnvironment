@@ -90,20 +90,33 @@ func New(ctx context.Context, st *store.Store, cryptoSvc *crypto.Service, cfg *c
 }
 
 // HTTPHandler returns the Streamable HTTP handler wrapped with request/response logging and authentication.
+// It includes an unsecured /health endpoint for load balancer liveness probes.
 func (s *Server) HTTPHandler() http.Handler {
+	mux := http.NewServeMux()
+
+	// Health check endpoint (unsecured)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 		return s.mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Logger: s.logger,
 	})
 
-	handler := httpLogging(s.logger, mcpHandler)
-
+	// MCP handler with authentication if enabled
+	var handler http.Handler = mcpHandler
 	if s.authenticator != nil {
 		handler = s.authenticator.Middleware(handler)
 	}
 
-	return handler
+	// Register the MCP handler at the root.
+	mux.Handle("/", handler)
+
+	// Wrap everything in logging.
+	return httpLogging(s.logger, mux)
 }
 
 // ServeStdio runs the MCP server on the stdio transport.
