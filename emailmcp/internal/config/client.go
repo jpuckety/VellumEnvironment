@@ -237,7 +237,7 @@ func (c *Client) EnsureHealthy(ctx context.Context, logger *slog.Logger) error {
 	return fmt.Errorf("config api not healthy after %d attempts: %w", healthCheckAttempts, lastErr)
 }
 
-func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID, accountID string) (*types.Account, error) {
+func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID, accountID string) ([]*types.Account, error) {
 	url := c.configURL(userID, accountID)
 	logger := c.log().With(
 		"op", "config_api_get",
@@ -284,37 +284,40 @@ func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID, account
 		return nil, fmt.Errorf("config api error: %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 
-	acc := &types.Account{}
-	if err := json.NewDecoder(resp.Body).Decode(acc); err != nil {
-		logger.ErrorContext(ctx, "failed to decode user config response", "error", err, "elapsed", time.Since(start))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
 
-	// Config API stores a single password used for IMAP (and typically SMTP).
-	if acc.SMTPPassword == "" {
-		acc.SMTPPassword = acc.IMAPPassword
-	}
-	if acc.ID == "" {
-		acc.ID = userID
+	var accs []*types.Account
+	if err := json.Unmarshal(body, &accs); err != nil {
+		acc := &types.Account{}
+		if err := json.Unmarshal(body, acc); err != nil {
+			logger.ErrorContext(ctx, "failed to decode user config response", "error", err, "elapsed", time.Since(start))
+			return nil, err
+		}
+		accs = []*types.Account{acc}
 	}
 
-	logger.InfoContext(ctx, "user config loaded",
-		"account_id", acc.ID,
-		"name", acc.Name,
-		"imap_host", acc.IMAPHost,
-		"imap_port", acc.IMAPPort,
-		"imap_username", acc.IMAPUsername,
-		"imap_use_tls", acc.IMAPUseTLS,
-		"smtp_host", acc.SMTPHost,
-		"smtp_port", acc.SMTPPort,
-		"smtp_username", acc.SMTPUsername,
-		"smtp_use_tls", acc.SMTPUseTLS,
-		"from_address", acc.FromAddress,
-		"has_imap_password", acc.IMAPPassword != "",
-		"has_smtp_password", acc.SMTPPassword != "",
+	if len(accs) == 0 {
+		return nil, ErrConfigNotFound
+	}
+
+	for _, acc := range accs {
+		// Config API stores a single password used for IMAP (and typically SMTP).
+		if acc.SMTPPassword == "" {
+			acc.SMTPPassword = acc.IMAPPassword
+		}
+		if acc.ID == "" {
+			acc.ID = userID
+		}
+	}
+
+	logger.InfoContext(ctx, "user configs loaded",
+		"count", len(accs),
 		"elapsed", time.Since(start),
 	)
-	return acc, nil
+	return accs, nil
 }
 
 // PutUserConfig creates or replaces an email account configuration.
@@ -495,10 +498,20 @@ func (c *Client) ListUserConfigs(ctx context.Context, googleToken, userID string
 		return nil, fmt.Errorf("config api error: %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
 	}
 
-	var accs []*types.Account
-	if err := json.NewDecoder(resp.Body).Decode(&accs); err != nil {
-		logger.ErrorContext(ctx, "failed to decode list response", "error", err, "elapsed", time.Since(start))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
+	}
+
+	var accs []*types.Account
+	if err := json.Unmarshal(body, &accs); err != nil {
+		// Try decoding as a single object
+		acc := &types.Account{}
+		if err2 := json.Unmarshal(body, acc); err2 != nil {
+			logger.ErrorContext(ctx, "failed to decode list response", "error", err, "elapsed", time.Since(start))
+			return nil, err
+		}
+		accs = []*types.Account{acc}
 	}
 
 	logger.InfoContext(ctx, "user configs loaded", "count", len(accs), "elapsed", time.Since(start))

@@ -127,12 +127,45 @@ func TestGetUserConfig_SendsGoogleIDTokenHeader(t *testing.T) {
 		HTTPClient:    ts.Client(),
 		Logger:        slog.New(slog.NewTextHandler(ioDiscard{}, nil)),
 	}
-	acc, err := c.GetUserConfig(context.Background(), wantToken, wantUser, "default")
+	accs, err := c.GetUserConfig(context.Background(), wantToken, wantUser, "default")
 	if err != nil {
 		t.Fatalf("GetUserConfig: %v", err)
 	}
-	if acc.ID != wantUser {
-		t.Errorf("acc.ID = %q, want %q", acc.ID, wantUser)
+	if len(accs) == 0 {
+		t.Fatal("expected at least one account")
+	}
+	if accs[0].ID != wantUser {
+		t.Errorf("accs[0].ID = %q, want %q", accs[0].ID, wantUser)
+	}
+}
+
+func TestGetUserConfig_HandlesArray(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Return an array of accounts
+		_ = json.NewEncoder(w).Encode([]types.Account{
+			{ID: "acc1", Name: "Account 1"},
+			{ID: "acc2", Name: "Account 2"},
+		})
+	}))
+	defer ts.Close()
+
+	c := &Client{
+		BaseURL:       strings.TrimRight(ts.URL, "/"),
+		ApplicationID: "emailmcp",
+		HTTPClient:    ts.Client(),
+		Logger:        slog.New(slog.NewTextHandler(ioDiscard{}, nil)),
+	}
+
+	accs, err := c.GetUserConfig(context.Background(), "token", "user1", "")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(accs) != 2 {
+		t.Errorf("expected 2 accounts, got %d", len(accs))
+	}
+	if accs[0].ID != "acc1" || accs[1].ID != "acc2" {
+		t.Errorf("unexpected account IDs: %v", accs)
 	}
 }
 

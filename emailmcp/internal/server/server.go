@@ -239,7 +239,7 @@ func (s *Server) registerTools() {
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "list_email_accounts",
-		Description: "List the authenticated user's configured email account (without credentials).",
+		Description: "List the authenticated user's configured email accounts (without credentials).",
 	}, s.listEmailAccounts)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -609,14 +609,26 @@ func (s *Server) getAccount(ctx context.Context, accountID string) (*types.Accou
 	}
 
 	s.logger.Debug("fetching config from API", "user", userInfo.Email, "account_id", accountID)
-	acc, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject, accountID)
+	accs, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject, accountID)
 	if err != nil {
 		if errors.Is(err, config.ErrConfigNotFound) {
 			return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
 		}
 		return nil, fmt.Errorf("fetch config from api: %w", err)
 	}
-	return acc, nil
+
+	if len(accs) == 0 {
+		return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
+	}
+
+	// Try to find the exact match by ID if multiple are returned.
+	for _, acc := range accs {
+		if acc.ID == accountID {
+			return acc, nil
+		}
+	}
+
+	return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
 }
 
 func defaultPort(p, def int) int {
