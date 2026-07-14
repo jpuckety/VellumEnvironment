@@ -108,8 +108,8 @@ func TestGetUserConfig_SendsGoogleIDTokenHeader(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+wantToken {
 			t.Errorf("Authorization = %q, want Bearer token", got)
 		}
-		if !strings.HasSuffix(r.URL.Path, "/configs/emailmcp/"+wantUser) {
-			t.Errorf("path = %q, want .../configs/emailmcp/%s", r.URL.Path, wantUser)
+		if !strings.HasSuffix(r.URL.Path, "/configs/emailmcp/"+wantUser+"/default") {
+			t.Errorf("path = %q, want .../configs/emailmcp/%s/default", r.URL.Path, wantUser)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(types.Account{
@@ -127,7 +127,7 @@ func TestGetUserConfig_SendsGoogleIDTokenHeader(t *testing.T) {
 		HTTPClient:    ts.Client(),
 		Logger:        slog.New(slog.NewTextHandler(ioDiscard{}, nil)),
 	}
-	acc, err := c.GetUserConfig(context.Background(), wantToken, wantUser)
+	acc, err := c.GetUserConfig(context.Background(), wantToken, wantUser, "default")
 	if err != nil {
 		t.Fatalf("GetUserConfig: %v", err)
 	}

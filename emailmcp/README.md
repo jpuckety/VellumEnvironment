@@ -131,7 +131,7 @@ To remove the deployment from EKS:
 | `delete_emails`       | Mark emails deleted                                      |
 | `send_email`          | Send message (text/HTML + attachments)                   |
 
-Account tools operate on the authenticated user's single config (keyed by Google `sub`).
+Account tools require an `account_id` parameter to specify which email account to use.
 
 ## Configuration
 

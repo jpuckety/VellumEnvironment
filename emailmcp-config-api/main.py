@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import boto3
 from botocore.exceptions import ClientError
+from boto3.dynamodb.conditions import Key
 
 dynamodb = boto3.resource('dynamodb')
 secretsmanager = boto3.client('secretsmanager')
@@ -65,27 +66,35 @@ def handler(event, context):
 
         # 2. Parse Path
         parts = path.strip('/').split('/')
-        if len(parts) != 3 or parts[0] != 'configs':
-            return response(400, {'error': 'Invalid path format. Expected /configs/{applicationId}/{userId}'})
+        if len(parts) < 3 or parts[0] != 'configs':
+            return response(400, {'error': 'Invalid path format. Expected /configs/{applicationId}/{userId}[/{accountId}]'})
         
         app_id = parts[1]
         path_user_id = parts[2]
+        account_id = parts[3] if len(parts) > 3 else None
         
         # 3. Authorize - User can only access their own userId
         if path_user_id != user_id:
             return response(403, {'error': 'Forbidden: You can only access your own configuration'})
         
         if method == 'GET':
-            return get_config(app_id, user_id)
+            if account_id:
+                return get_config(app_id, user_id, account_id)
+            else:
+                return list_configs(app_id, user_id)
         elif method == 'PUT':
+            if not account_id:
+                return response(400, {'error': 'Account ID required for PUT'})
             body_str = event.get('body', '{}')
             if event.get('isBase64Encoded', False):
                 import base64
                 body_str = base64.b64decode(body_str).decode('utf-8')
             body = json.loads(body_str)
-            return put_config(app_id, user_id, body)
+            return put_config(app_id, user_id, account_id, body)
         elif method == 'DELETE':
-            return delete_config(app_id, user_id)
+            if not account_id:
+                return response(400, {'error': 'Account ID required for DELETE'})
+            return delete_config(app_id, user_id, account_id)
         else:
             return response(405, {'error': 'Method not allowed'})
 
@@ -95,10 +104,46 @@ def handler(event, context):
         traceback.print_exc()
         return response(500, {'error': f'Internal server error: {str(e)}'})
 
-def get_config(app_id, user_id):
+def list_configs(app_id, user_id):
     try:
-        res = table.get_item(Key={'applicationId': app_id, 'userId': user_id})
+        # Query all accounts for this user. SK format is "userId#accountId".
+        res = table.query(
+            KeyConditionExpression=Key('applicationId').eq(app_id) & Key('userId').begins_with(f"{user_id}#")
+        )
+        items = res.get('Items', [])
+        
+        # Also check for legacy single-account config where SK is just "userId"
+        legacy_res = table.get_item(Key={'applicationId': app_id, 'userId': user_id})
+        if legacy_res.get('Item'):
+            items.append(legacy_res.get('Item'))
+
+        # Fetch passwords for all items (if secrets exist)
+        for item in items:
+            secret_arn = item.get('secretArn')
+            if secret_arn:
+                try:
+                    secret_res = secretsmanager.get_secret_value(SecretId=secret_arn)
+                    secret_json = json.loads(secret_res['SecretString'])
+                    item['password'] = secret_json.get('password')
+                except ClientError:
+                    item['password'] = None
+        
+        return response(200, items)
+    except ClientError as e:
+        return response(500, {'error': str(e)})
+
+def get_config(app_id, user_id, account_id):
+    try:
+        sk = f"{user_id}#{account_id}"
+        # Fallback for legacy ID if account_id is some special value or we just want to be safe
+        res = table.get_item(Key={'applicationId': app_id, 'userId': sk})
         item = res.get('Item')
+        
+        if not item and account_id == 'default':
+            # Try legacy
+            res = table.get_item(Key={'applicationId': app_id, 'userId': user_id})
+            item = res.get('Item')
+
         if not item:
             return response(404, {'error': 'Config not found'})
         
@@ -118,11 +163,12 @@ def get_config(app_id, user_id):
     except ClientError as e:
         return response(500, {'error': str(e)})
 
-def put_config(app_id, user_id, body):
+def put_config(app_id, user_id, account_id, body):
     # body should contain imapHost, imapPort, imapUsername, and password
     password = body.pop('password', None)
     
-    secret_id = f"emailmcp/imap/{app_id}/{user_id}"
+    sk = f"{user_id}#{account_id}"
+    secret_id = f"emailmcp/imap/{app_id}/{user_id}/{account_id}"
     secret_arn = None
     
     if password:
@@ -138,27 +184,30 @@ def put_config(app_id, user_id, body):
                 secret_res = secretsmanager.create_secret(
                     Name=secret_id,
                     SecretString=json.dumps({'password': password}, cls=DynamoJSONEncoder),
-                    Description=f"IMAP password for {user_id} in {app_id}"
+                    Description=f"IMAP password for {user_id}/{account_id} in {app_id}"
                 )
                 secret_arn = secret_res['ARN']
         except ClientError as e:
             return response(500, {'error': f"Failed to save secret: {str(e)}"})
 
     body['applicationId'] = app_id
-    body['userId'] = user_id
+    body['userId'] = sk
+    # Store account_id in the body too for convenience
+    body['id'] = account_id
     if secret_arn:
         body['secretArn'] = secret_arn
     
     try:
         table.put_item(Item=body)
-        return response(200, {'message': 'Config saved successfully', 'userId': user_id, 'applicationId': app_id})
+        return response(200, {'message': 'Config saved successfully', 'userId': user_id, 'accountId': account_id, 'applicationId': app_id})
     except ClientError as e:
         return response(500, {'error': str(e)})
 
-def delete_config(app_id, user_id):
-    secret_id = f"emailmcp/imap/{app_id}/{user_id}"
+def delete_config(app_id, user_id, account_id):
+    sk = f"{user_id}#{account_id}"
+    secret_id = f"emailmcp/imap/{app_id}/{user_id}/{account_id}"
     try:
-        table.delete_item(Key={'applicationId': app_id, 'userId': user_id})
+        table.delete_item(Key={'applicationId': app_id, 'userId': sk})
         try:
             secretsmanager.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
         except (secretsmanager.exceptions.ResourceNotFoundException, ClientError):

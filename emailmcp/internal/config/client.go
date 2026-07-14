@@ -129,8 +129,11 @@ func (c *Client) sign(ctx context.Context, req *http.Request, payload []byte) er
 	return nil
 }
 
-func (c *Client) configURL(userID string) string {
-	return fmt.Sprintf("%s/configs/%s/%s", c.BaseURL, c.ApplicationID, userID)
+func (c *Client) configURL(userID, accountID string) string {
+	if accountID == "" {
+		return fmt.Sprintf("%s/configs/%s/%s", c.BaseURL, c.ApplicationID, userID)
+	}
+	return fmt.Sprintf("%s/configs/%s/%s/%s", c.BaseURL, c.ApplicationID, userID, accountID)
 }
 
 // setGoogleAuth attaches the Google ID token for Config API application-level auth.
@@ -234,14 +237,14 @@ func (c *Client) EnsureHealthy(ctx context.Context, logger *slog.Logger) error {
 	return fmt.Errorf("config api not healthy after %d attempts: %w", healthCheckAttempts, lastErr)
 }
 
-func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID string) (*types.Account, error) {
-	url := c.configURL(userID)
+func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID, accountID string) (*types.Account, error) {
+	url := c.configURL(userID, accountID)
 	logger := c.log().With(
 		"op", "config_api_get",
 		"user_id", userID,
+		"account_id", accountID,
 		"application_id", c.ApplicationID,
 		"url", url,
-		"has_google_token", googleToken != "",
 	)
 	logger.DebugContext(ctx, "fetching user config")
 
@@ -314,15 +317,15 @@ func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID string) 
 	return acc, nil
 }
 
-// PutUserConfig creates or replaces the authenticated user's account configuration.
+// PutUserConfig creates or replaces an email account configuration.
 func (c *Client) PutUserConfig(ctx context.Context, googleToken, userID string, acc *types.Account) error {
-	url := c.configURL(userID)
+	url := c.configURL(userID, acc.ID)
 	logger := c.log().With(
 		"op", "config_api_put",
 		"user_id", userID,
+		"account_id", acc.ID,
 		"application_id", c.ApplicationID,
 		"url", url,
-		"has_google_token", googleToken != "",
 	)
 	if acc != nil {
 		logger = logger.With(
@@ -400,17 +403,18 @@ func (c *Client) PutUserConfig(ctx context.Context, googleToken, userID string, 
 	return nil
 }
 
-// DeleteUserConfig removes the authenticated user's account configuration.
-func (c *Client) DeleteUserConfig(ctx context.Context, googleToken, userID string) error {
-	url := c.configURL(userID)
+// DeleteUserConfig removes an email account configuration.
+func (c *Client) DeleteUserConfig(ctx context.Context, googleToken, userID, accountID string) error {
+	url := c.configURL(userID, accountID)
 	logger := c.log().With(
 		"op", "config_api_delete",
 		"user_id", userID,
+		"account_id", accountID,
 		"application_id", c.ApplicationID,
 		"url", url,
 		"has_google_token", googleToken != "",
 	)
-	logger.DebugContext(ctx, "deleting user config")
+	logger.DebugContext(ctx, "deleting account config")
 
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
@@ -426,13 +430,13 @@ func (c *Client) DeleteUserConfig(ctx context.Context, googleToken, userID strin
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		logger.ErrorContext(ctx, "delete user config request failed", "error", err, "elapsed", time.Since(start))
+		logger.ErrorContext(ctx, "delete account config request failed", "error", err, "elapsed", time.Since(start))
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		logger.InfoContext(ctx, "user config not found for delete",
+		logger.InfoContext(ctx, "account config not found for delete",
 			"status", resp.StatusCode,
 			"elapsed", time.Since(start),
 		)
@@ -440,13 +444,63 @@ func (c *Client) DeleteUserConfig(ctx context.Context, googleToken, userID strin
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		logger.ErrorContext(ctx, "delete user config API error",
+		logger.ErrorContext(ctx, "delete account config API error",
 			"status", resp.StatusCode,
 			"body", strings.TrimSpace(string(respBody)),
 			"elapsed", time.Since(start),
 		)
 		return fmt.Errorf("config api error: %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
 	}
-	logger.InfoContext(ctx, "user config deleted", "elapsed", time.Since(start))
+	logger.InfoContext(ctx, "account config deleted", "elapsed", time.Since(start))
 	return nil
+}
+
+// ListUserConfigs returns all email accounts for the authenticated user.
+func (c *Client) ListUserConfigs(ctx context.Context, googleToken, userID string) ([]*types.Account, error) {
+	url := c.configURL(userID, "")
+	logger := c.log().With(
+		"op", "config_api_list",
+		"user_id", userID,
+		"application_id", c.ApplicationID,
+		"url", url,
+	)
+	logger.DebugContext(ctx, "listing user configs")
+
+	start := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		logger.ErrorContext(ctx, "failed to build list request", "error", err)
+		return nil, err
+	}
+	c.setGoogleAuth(req, googleToken)
+
+	if err := c.sign(ctx, req, nil); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		logger.ErrorContext(ctx, "list user configs request failed", "error", err, "elapsed", time.Since(start))
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		logger.ErrorContext(ctx, "list user configs API error",
+			"status", resp.StatusCode,
+			"body", strings.TrimSpace(string(respBody)),
+			"elapsed", time.Since(start),
+		)
+		return nil, fmt.Errorf("config api error: %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
+	}
+
+	var accs []*types.Account
+	if err := json.NewDecoder(resp.Body).Decode(&accs); err != nil {
+		logger.ErrorContext(ctx, "failed to decode list response", "error", err, "elapsed", time.Since(start))
+		return nil, err
+	}
+
+	logger.InfoContext(ctx, "user configs loaded", "count", len(accs), "elapsed", time.Since(start))
+	return accs, nil
 }

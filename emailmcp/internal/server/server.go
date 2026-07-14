@@ -288,6 +288,7 @@ func (s *Server) registerTools() {
 // --- Input structs (for schema) ---
 
 type AddAccountInput struct {
+	ID           string `json:"id,omitempty" jsonschema:"Optional unique ID for the account; auto-generated from name if empty"`
 	Name         string `json:"name" jsonschema:"Human friendly name for the account"`
 	IMAPHost     string `json:"imap_host"`
 	IMAPPort     int    `json:"imap_port" jsonschema:"default:993"`
@@ -305,15 +306,15 @@ type AddAccountInput struct {
 }
 
 type AccountIDInput struct {
-	AccountID string `json:"account_id,omitempty" jsonschema:"Optional account ID; defaults to the authenticated user"`
+	AccountID string `json:"account_id" jsonschema:"Account ID"`
 }
 
 type ListFoldersInput struct {
-	AccountID string `json:"account_id,omitempty"`
+	AccountID string `json:"account_id"`
 }
 
 type SearchEmailsInput struct {
-	AccountID string `json:"account_id,omitempty"`
+	AccountID string `json:"account_id"`
 	Folder    string `json:"folder,omitempty" jsonschema:"Folder to search, defaults to INBOX"`
 	Query     string `json:"query,omitempty" jsonschema:"Simple text search in subject/body"`
 	From      string `json:"from,omitempty"`
@@ -322,20 +323,20 @@ type SearchEmailsInput struct {
 }
 
 type ReadEmailInput struct {
-	AccountID string `json:"account_id,omitempty"`
+	AccountID string `json:"account_id"`
 	Folder    string `json:"folder,omitempty"`
 	UID       uint32 `json:"uid"`
 }
 
 type MoveEmailsInput struct {
-	AccountID  string   `json:"account_id,omitempty"`
+	AccountID  string   `json:"account_id"`
 	Folder     string   `json:"folder,omitempty"`
 	UIDs       []uint32 `json:"uids"`
 	DestFolder string   `json:"dest_folder"`
 }
 
 type FlagEmailsInput struct {
-	AccountID string   `json:"account_id,omitempty"`
+	AccountID string   `json:"account_id"`
 	Folder    string   `json:"folder,omitempty"`
 	UIDs      []uint32 `json:"uids"`
 	Flags     []string `json:"flags"`
@@ -343,13 +344,13 @@ type FlagEmailsInput struct {
 }
 
 type DeleteEmailsInput struct {
-	AccountID string   `json:"account_id,omitempty"`
+	AccountID string   `json:"account_id"`
 	Folder    string   `json:"folder,omitempty"`
 	UIDs      []uint32 `json:"uids"`
 }
 
 type SendEmailToolInput struct {
-	AccountID   string                  `json:"account_id,omitempty"`
+	AccountID   string                  `json:"account_id"`
 	To          []string                `json:"to"`
 	Cc          []string                `json:"cc,omitempty"`
 	Bcc         []string                `json:"bcc,omitempty"`
@@ -383,8 +384,17 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		smtpPass = in.IMAPPassword
 	}
 
+	// Generate a slug from name if ID is not provided
+	accountID := in.ID
+	if accountID == "" {
+		accountID = strings.ToLower(strings.ReplaceAll(in.Name, " ", "-"))
+	}
+	if accountID == "" {
+		accountID = "default"
+	}
+
 	acc := &types.Account{
-		ID:           user.Subject,
+		ID:           accountID,
 		Name:         in.Name,
 		IMAPHost:     in.IMAPHost,
 		IMAPPort:     defaultPort(in.IMAPPort, 993),
@@ -416,26 +426,26 @@ func (s *Server) listEmailAccounts(ctx context.Context, req *mcp.CallToolRequest
 		return nil, nil, err
 	}
 
-	acc, err := s.configClient.GetUserConfig(ctx, token, user.Subject)
+	accs, err := s.configClient.ListUserConfigs(ctx, token, user.Subject)
 	if err != nil {
-		if errors.Is(err, config.ErrConfigNotFound) {
-			return nil, map[string]any{"accounts": []types.AccountSummary{}}, nil
-		}
 		return nil, nil, err
 	}
 
-	summary := types.AccountSummary{
-		ID:          acc.ID,
-		Name:        acc.Name,
-		IMAPHost:    acc.IMAPHost,
-		IMAPPort:    acc.IMAPPort,
-		SMTPHost:    acc.SMTPHost,
-		SMTPPort:    acc.SMTPPort,
-		FromAddress: acc.FromAddress,
-		CreatedAt:   acc.CreatedAt,
-		UpdatedAt:   acc.UpdatedAt,
+	summaries := make([]types.AccountSummary, 0, len(accs))
+	for _, acc := range accs {
+		summaries = append(summaries, types.AccountSummary{
+			ID:          acc.ID,
+			Name:        acc.Name,
+			IMAPHost:    acc.IMAPHost,
+			IMAPPort:    acc.IMAPPort,
+			SMTPHost:    acc.SMTPHost,
+			SMTPPort:    acc.SMTPPort,
+			FromAddress: acc.FromAddress,
+			CreatedAt:   acc.CreatedAt,
+			UpdatedAt:   acc.UpdatedAt,
+		})
 	}
-	return nil, map[string]any{"accounts": []types.AccountSummary{summary}}, nil
+	return nil, map[string]any{"accounts": summaries}, nil
 }
 
 func (s *Server) removeEmailAccount(ctx context.Context, req *mcp.CallToolRequest, in AccountIDInput) (*mcp.CallToolResult, any, error) {
@@ -443,22 +453,22 @@ func (s *Server) removeEmailAccount(ctx context.Context, req *mcp.CallToolReques
 	if err != nil {
 		return nil, nil, err
 	}
-	if in.AccountID != "" && in.AccountID != user.Subject {
-		return nil, nil, fmt.Errorf("account_id does not match authenticated user")
+	if in.AccountID == "" {
+		return nil, nil, errors.New("account_id is required")
 	}
 
-	if err := s.configClient.DeleteUserConfig(ctx, token, user.Subject); err != nil {
+	if err := s.configClient.DeleteUserConfig(ctx, token, user.Subject, in.AccountID); err != nil {
 		if errors.Is(err, config.ErrConfigNotFound) {
 			return nil, nil, errors.New("account not found")
 		}
 		return nil, nil, err
 	}
-	s.logger.Info("account removed", "id", user.Subject)
+	s.logger.Info("account removed", "id", in.AccountID)
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Account removed"}}}, nil, nil
 }
 
 func (s *Server) listFolders(ctx context.Context, req *mcp.CallToolRequest, in ListFoldersInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx)
+	acc, err := s.getAccount(ctx, in.AccountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -470,7 +480,7 @@ func (s *Server) listFolders(ctx context.Context, req *mcp.CallToolRequest, in L
 }
 
 func (s *Server) searchEmails(ctx context.Context, req *mcp.CallToolRequest, in SearchEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx)
+	acc, err := s.getAccount(ctx, in.AccountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -502,7 +512,7 @@ func (s *Server) searchEmails(ctx context.Context, req *mcp.CallToolRequest, in 
 }
 
 func (s *Server) readEmail(ctx context.Context, req *mcp.CallToolRequest, in ReadEmailInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx)
+	acc, err := s.getAccount(ctx, in.AccountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -514,7 +524,7 @@ func (s *Server) readEmail(ctx context.Context, req *mcp.CallToolRequest, in Rea
 }
 
 func (s *Server) moveEmails(ctx context.Context, req *mcp.CallToolRequest, in MoveEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx)
+	acc, err := s.getAccount(ctx, in.AccountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -525,7 +535,7 @@ func (s *Server) moveEmails(ctx context.Context, req *mcp.CallToolRequest, in Mo
 }
 
 func (s *Server) flagEmails(ctx context.Context, req *mcp.CallToolRequest, in FlagEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx)
+	acc, err := s.getAccount(ctx, in.AccountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -540,7 +550,7 @@ func (s *Server) flagEmails(ctx context.Context, req *mcp.CallToolRequest, in Fl
 }
 
 func (s *Server) deleteEmails(ctx context.Context, req *mcp.CallToolRequest, in DeleteEmailsInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx)
+	acc, err := s.getAccount(ctx, in.AccountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -551,7 +561,7 @@ func (s *Server) deleteEmails(ctx context.Context, req *mcp.CallToolRequest, in 
 }
 
 func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in SendEmailToolInput) (*mcp.CallToolResult, any, error) {
-	acc, err := s.getAccount(ctx)
+	acc, err := s.getAccount(ctx, in.AccountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -587,18 +597,22 @@ func (s *Server) requireAuth(ctx context.Context) (*UserInfo, string, error) {
 	return userInfo, token, nil
 }
 
-// getAccount loads the authenticated user's account from the Config API.
-func (s *Server) getAccount(ctx context.Context) (*types.Account, error) {
+// getAccount loads an authenticated user's email account from the Config API.
+func (s *Server) getAccount(ctx context.Context, accountID string) (*types.Account, error) {
 	userInfo, token, err := s.requireAuth(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	s.logger.Debug("fetching config from API", "user", userInfo.Email, "sub", userInfo.Subject)
-	acc, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject)
+	if accountID == "" {
+		return nil, errors.New("account_id is required")
+	}
+
+	s.logger.Debug("fetching config from API", "user", userInfo.Email, "account_id", accountID)
+	acc, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject, accountID)
 	if err != nil {
 		if errors.Is(err, config.ErrConfigNotFound) {
-			return nil, errors.New("no email account configured for this user; call add_email_account first")
+			return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
 		}
 		return nil, fmt.Errorf("fetch config from api: %w", err)
 	}
