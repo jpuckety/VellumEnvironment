@@ -1,5 +1,7 @@
 import json
 import os
+from decimal import Decimal
+
 import boto3
 from botocore.exceptions import ClientError
 
@@ -8,6 +10,20 @@ secretsmanager = boto3.client('secretsmanager')
 
 TABLE_NAME = os.environ.get('TABLE_NAME')
 table = dynamodb.Table(TABLE_NAME)
+
+
+class DynamoJSONEncoder(json.JSONEncoder):
+    """Serialize DynamoDB AttributeValue types that boto3 returns as Decimal/set."""
+
+    def default(self, o):
+        if isinstance(o, Decimal):
+            # Ports and other whole numbers should stay integers for Go clients.
+            if o == o.to_integral_value():
+                return int(o)
+            return float(o)
+        if isinstance(o, set):
+            return list(o)
+        return super().default(o)
 
 def handler(event, context):
     try:
@@ -26,19 +42,21 @@ def handler(event, context):
         from google.oauth2 import id_token
         from google.auth.transport import requests as google_requests
 
-        # 1. Authenticate
-        headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
-        auth_header = headers.get('authorization', '')
-        if not auth_header.startswith('Bearer '):
-            return response(401, {'error': 'Missing or invalid Authorization header'})
-        
-        token = auth_header.split(' ')[1]
-        
+        # 1. Authenticate with Google ID token.
+        # Prefer X-Google-ID-Token: Function URL AWS_IAM auth puts SigV4 in Authorization,
+        # which overwrites any Bearer token the client might set on that header.
+        headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}
+        token = extract_google_token(headers)
+        if not token:
+            return response(401, {
+                'error': 'Missing or invalid Google ID token '
+                         '(expected X-Google-ID-Token or Authorization: Bearer)'
+            })
+
         google_client_id = os.environ.get('GOOGLE_CLIENT_ID')
-        
+
         try:
-            # We verify the token. In a real world app, you'd specify the audience (client ID)
-            # but if it's not provided, we just verify the signature and expiration.
+            # Verify signature, expiry, and audience (GOOGLE_CLIENT_ID when set).
             id_info = id_token.verify_oauth2_token(token, google_requests.Request(), google_client_id)
             user_id = id_info['sub']
             # email = id_info['email']
@@ -112,14 +130,14 @@ def put_config(app_id, user_id, body):
             try:
                 secretsmanager.put_secret_value(
                     SecretId=secret_id,
-                    SecretString=json.dumps({'password': password})
+                    SecretString=json.dumps({'password': password}, cls=DynamoJSONEncoder)
                 )
                 secret_res = secretsmanager.describe_secret(SecretId=secret_id)
                 secret_arn = secret_res['ARN']
             except secretsmanager.exceptions.ResourceNotFoundException:
                 secret_res = secretsmanager.create_secret(
                     Name=secret_id,
-                    SecretString=json.dumps({'password': password}),
+                    SecretString=json.dumps({'password': password}, cls=DynamoJSONEncoder),
                     Description=f"IMAP password for {user_id} in {app_id}"
                 )
                 secret_arn = secret_res['ARN']
@@ -149,9 +167,24 @@ def delete_config(app_id, user_id):
     except ClientError as e:
         return response(500, {'error': str(e)})
 
+def extract_google_token(headers):
+    """Return the Google ID token from request headers, or empty string.
+
+    X-Google-ID-Token is preferred so it can coexist with SigV4 Authorization
+    used by Lambda Function URL AWS_IAM auth.
+    """
+    token = (headers.get('x-google-id-token') or '').strip()
+    if token:
+        return token
+    auth_header = (headers.get('authorization') or '').strip()
+    if auth_header.lower().startswith('bearer '):
+        return auth_header.split(' ', 1)[1].strip()
+    return ''
+
+
 def response(status_code, body):
     return {
         'statusCode': status_code,
         'headers': {'Content-Type': 'application/json'},
-        'body': json.dumps(body)
+        'body': json.dumps(body, cls=DynamoJSONEncoder),
     }

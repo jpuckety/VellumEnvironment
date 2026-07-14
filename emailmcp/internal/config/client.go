@@ -25,6 +25,11 @@ import (
 const (
 	healthCheckAttempts = 5
 	healthCheckBackoff  = 2 * time.Second
+
+	// googleIDTokenHeader carries the Google ID token for Config API user auth.
+	// It must not use Authorization: SigV4 overwrites that header when the
+	// Function URL uses AWS_IAM auth.
+	googleIDTokenHeader = "X-Google-ID-Token"
 )
 
 // ErrConfigNotFound is returned when the Config API has no config for the user.
@@ -126,6 +131,17 @@ func (c *Client) sign(ctx context.Context, req *http.Request, payload []byte) er
 
 func (c *Client) configURL(userID string) string {
 	return fmt.Sprintf("%s/configs/%s/%s", c.BaseURL, c.ApplicationID, userID)
+}
+
+// setGoogleAuth attaches the Google ID token for Config API application-level auth.
+// When SigV4 is enabled, Authorization is reserved for AWS IAM and the token is
+// only sent on X-Google-ID-Token. Without SigV4, Bearer Authorization is also set
+// for simpler local/dev setups that do not use Function URL IAM auth.
+func (c *Client) setGoogleAuth(req *http.Request, googleToken string) {
+	req.Header.Set(googleIDTokenHeader, googleToken)
+	if c.AWSConfig == nil {
+		req.Header.Set("Authorization", "Bearer "+googleToken)
+	}
 }
 
 // CheckHealth calls GET /health on the config API and returns an error if it is not healthy.
@@ -235,7 +251,7 @@ func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID string) 
 		logger.ErrorContext(ctx, "failed to build get request", "error", err)
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+googleToken)
+	c.setGoogleAuth(req, googleToken)
 
 	if err := c.sign(ctx, req, nil); err != nil {
 		return nil, err
@@ -353,7 +369,7 @@ func (c *Client) PutUserConfig(ctx context.Context, googleToken, userID string, 
 		logger.ErrorContext(ctx, "failed to build put request", "error", err)
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+googleToken)
+	c.setGoogleAuth(req, googleToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	if err := c.sign(ctx, req, body); err != nil {
@@ -402,7 +418,7 @@ func (c *Client) DeleteUserConfig(ctx context.Context, googleToken, userID strin
 		logger.ErrorContext(ctx, "failed to build delete request", "error", err)
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+googleToken)
+	c.setGoogleAuth(req, googleToken)
 
 	if err := c.sign(ctx, req, nil); err != nil {
 		return err

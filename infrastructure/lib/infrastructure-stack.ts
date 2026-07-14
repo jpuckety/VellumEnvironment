@@ -71,7 +71,7 @@ export class InfrastructureStack extends cdk.Stack {
       cors: {
         allowedOrigins: ['*'],
         allowedMethods: [lambda.HttpMethod.ALL],
-        allowedHeaders: ['Authorization', 'Content-Type'],
+        allowedHeaders: ['Authorization', 'Content-Type', 'X-Google-ID-Token'],
       },
     });
 
