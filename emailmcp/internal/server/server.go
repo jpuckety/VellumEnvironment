@@ -262,8 +262,12 @@ func (s *Server) registerTools() {
 	}, s.listFolders)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "search_emails",
-		Description: "Search emails in a folder. Returns summaries. Supports basic criteria.",
+		Name: "search_emails",
+		Description: "Search emails in a folder and return summaries. " +
+			"Supports basic criteria (query, from, since). " +
+			"Use the optional 'limit' parameter to control how many messages are returned (default 50). " +
+			"Results are sorted by newest internal date (arrival) by default; " +
+			"override with sort_by (arrival, date, from, to, cc, subject, size) and optional sort_reverse.",
 	}, s.searchEmails)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -328,7 +332,11 @@ type SearchEmailsInput struct {
 	Query     string `json:"query,omitempty" jsonschema:"Simple text search in subject/body"`
 	From      string `json:"from,omitempty"`
 	Since     string `json:"since,omitempty" jsonschema:"Date in RFC3339 or YYYY-MM-DD"`
-	Limit     int    `json:"limit,omitempty" jsonschema:"Max results, default 50"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum number of message summaries to return (default 50)"`
+	// SortBy is one of: arrival (internal date, default), date, from, to, cc, subject, size.
+	SortBy string `json:"sort_by,omitempty" jsonschema:"Sort key: arrival (internal date, default), date, from, to, cc, subject, size"`
+	// SortReverse overrides default direction. Defaults to true for arrival/date/size, false for string keys.
+	SortReverse *bool `json:"sort_reverse,omitempty" jsonschema:"Reverse sort order. Defaults to true for arrival/date/size (newest/largest first), false for from/to/cc/subject"`
 }
 
 type ReadEmailInput struct {
@@ -538,8 +546,16 @@ func (s *Server) searchEmails(ctx context.Context, req *mcp.CallToolRequest, in 
 		limit = 50
 	}
 
+	sortKey, err := imapmgr.ParseSearchSortKey(in.SortBy)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	folder := in.Folder
-	summaries, err := s.imapMgr.SearchEmails(ctx, acc, folder, crit, limit)
+	summaries, err := s.imapMgr.SearchEmails(ctx, acc, folder, crit, limit, imapmgr.SearchSort{
+		Key:     sortKey,
+		Reverse: in.SortReverse,
+	})
 	if err != nil {
 		return nil, nil, err
 	}

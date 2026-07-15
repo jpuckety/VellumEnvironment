@@ -430,12 +430,23 @@ func (m *Manager) ListFolders(ctx context.Context, acc *types.Account) ([]types.
 }
 
 // SearchEmails searches a folder using simple criteria.
-func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder string, criteria imap.SearchCriteria, limit int) ([]types.EmailSummary, error) {
+// Results are ordered by sort (default: newest internal date / arrival, reverse).
+// When the server supports the IMAP SORT extension, ordering is done server-side
+// before limit is applied. Otherwise a best-effort client-side path is used.
+func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder string, criteria imap.SearchCriteria, limit int, sortOpt SearchSort) ([]types.EmailSummary, error) {
 	if folder == "" {
 		folder = "INBOX"
 	}
+	sortKey, reverse := sortOpt.Resolve()
 
-	logger := m.cfg.Logger.With("op", "search_emails", "account_id", acc.ID, "folder", folder, "limit", limit)
+	logger := m.cfg.Logger.With(
+		"op", "search_emails",
+		"account_id", acc.ID,
+		"folder", folder,
+		"limit", limit,
+		"sort_by", string(sortKey),
+		"sort_reverse", reverse,
+	)
 	logger.DebugContext(ctx, "searching emails")
 	start := time.Now()
 
@@ -458,27 +469,28 @@ func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder s
 	}
 	conn.lastSelected = folder
 
-	// Search (prefer UID based)
-	searchCmd := conn.client.UIDSearch(&criteria, nil)
-	data, err := searchCmd.Wait()
+	uidList, totalMatches, usedServerSort, err := searchSortedUIDs(conn.client, &criteria, sortKey, reverse)
 	if err != nil {
 		hadErr = true
-		logger.ErrorContext(ctx, "UID SEARCH failed", "error", err, "elapsed", time.Since(start))
-		return nil, fmt.Errorf("search: %w", err)
+		logger.ErrorContext(ctx, "search/sort failed", "error", err, "elapsed", time.Since(start))
+		return nil, err
 	}
-
-	uidList := data.AllUIDs()
 	if len(uidList) == 0 {
 		logger.InfoContext(ctx, "search returned no results", "elapsed", time.Since(start))
 		return []types.EmailSummary{}, nil
 	}
 
-	totalMatches := len(uidList)
-	// Limit
-	if limit > 0 && len(uidList) > limit {
+	// Server SORT (or arrival UID heuristic) can limit before FETCH.
+	// Other client-side sorts need envelopes for all matches first.
+	limitBeforeFetch := usedServerSort || sortKey == SortKeyArrival
+	if limitBeforeFetch && limit > 0 && len(uidList) > limit {
 		uidList = uidList[:limit]
 	}
-	logger.DebugContext(ctx, "fetching summaries", "total_matches", totalMatches, "fetching", len(uidList))
+	logger.DebugContext(ctx, "fetching summaries",
+		"total_matches", totalMatches,
+		"fetching", len(uidList),
+		"server_sort", usedServerSort,
+	)
 
 	// Fetch summaries (Envelope + Flags + RFC822.SIZE)
 	fetchOpts := &imap.FetchOptions{
@@ -511,6 +523,7 @@ func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder s
 			summary.Subject = msg.Envelope.Subject
 			summary.From = convertAddresses(msg.Envelope.From)
 			summary.To = convertAddresses(msg.Envelope.To)
+			summary.Cc = convertAddresses(msg.Envelope.Cc)
 			summary.Date = msg.Envelope.Date
 		}
 		// Basic detection of attachments via body structure if present
@@ -520,9 +533,60 @@ func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder s
 		summaries = append(summaries, summary)
 	}
 
+	if !limitBeforeFetch {
+		sortSummaries(summaries, sortKey, reverse)
+		if limit > 0 && len(summaries) > limit {
+			summaries = summaries[:limit]
+		}
+	} else {
+		// FETCH does not guarantee response order — re-apply search/sort order.
+		summaries = orderSummariesByUIDs(summaries, uidList)
+	}
+
 	logger.InfoContext(ctx, "search complete",
 		"total_matches", totalMatches, "returned", len(summaries), "elapsed", time.Since(start))
 	return summaries, nil
+}
+
+// searchSortedUIDs returns matching UIDs in sort order.
+// usedServerSort is true when IMAP SORT produced the order.
+func searchSortedUIDs(client *imapclient.Client, criteria *imap.SearchCriteria, sortKey SearchSortKey, reverse bool) (uids []imap.UID, total int, usedServerSort bool, err error) {
+	if client.Caps().Has(imap.CapSort) {
+		nums, sortErr := client.UIDSort(&imapclient.SortOptions{
+			SearchCriteria: criteria,
+			SortCriteria: []imapclient.SortCriterion{{
+				Key:     toIMAPSortKey(sortKey),
+				Reverse: reverse,
+			}},
+		}).Wait()
+		if sortErr == nil {
+			uids = uidsToUIDs(nums)
+			return uids, len(uids), true, nil
+		}
+		// Fall through to SEARCH + client-side ordering.
+	}
+
+	searchCmd := client.UIDSearch(criteria, nil)
+	data, err := searchCmd.Wait()
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("search: %w", err)
+	}
+	uids = data.AllUIDs()
+	total = len(uids)
+	if total == 0 {
+		return uids, 0, false, nil
+	}
+
+	// Without SORT, approximate ARRIVAL using UID order (usually ascending by receipt).
+	if sortKey == SortKeyArrival {
+		if reverse {
+			reverseUIDs(uids)
+		}
+		return uids, total, false, nil
+	}
+
+	// Other keys require FETCH of all matches before sorting (caller handles that).
+	return uids, total, false, nil
 }
 
 // GetEmail fetches a full email by UID.
