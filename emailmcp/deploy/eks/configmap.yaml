@@ -11,3 +11,6 @@ data:
   EMAILMCP_LOG_LEVEL: "${EMAILMCP_LOG_LEVEL}"
   EMAILMCP_LISTEN_ADDR: ":8080"
   PUBLIC_BASE_URL: "${PUBLIC_BASE_URL}"
+  # Comma-separated HTTPS redirect allowlist. Empty = not enforced.
+  # Examples: "app.example.com,*.corp.example.com,https://web.example.com/oauth/cb"
+  OAUTH_REDIRECT_ALLOWLIST: "${OAUTH_REDIRECT_ALLOWLIST}"

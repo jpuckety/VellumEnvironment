@@ -62,7 +62,8 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 - One email account config per authenticated Google user (keyed by `sub`).
 - Account CRUD goes through `config.Client` (GET/PUT/DELETE Config API).
 - All IMAP/SMTP operations take a full `*types.Account` with plaintext passwords from the Config API.
-- HTTP MCP traffic requires the server's own session JWT (issued after Google sign-in). `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`, and `CONFIG_API_URL` are required at startup for HTTP mode; `EMAILMCP_JWT_SECRET` optionally pins the JWT signing key.
+- HTTP MCP traffic requires the server's own session JWT (issued after Google sign-in). `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`, and `CONFIG_API_URL` are required at startup for HTTP mode; set `EMAILMCP_JWT_SECRET` for stable sessions (required on EKS via `deploy/eks/secret.yaml`). Google ID tokens are cryptographically verified (signature, aud, iss, exp) before minting session JWTs.
+- `OAUTH_REDIRECT_ALLOWLIST` (optional, ConfigMap): when non-empty, HTTPS OAuth redirect URIs must match the allowlist; when blank, the allowlist is not enforced. Loopback HTTP and custom schemes remain allowed for desktop MCP clients.
 - MCP OAuth lives in `internal/server/oauth.go`: protected-resource + AS metadata, DCR, authorize → Google, callback, token. After Google verifies the user, the token endpoint issues a short-lived JWT (1h, minted/verified via `internal/server/jwt.go`) as `access_token`, paired with a 7-day refresh token. The Google ID token is embedded in the JWT and forwarded downstream to the Config API (which still verifies a genuine Google token).
 - The main server uses Streamable HTTP (`mcp.NewStreamableHTTPHandler`).
 

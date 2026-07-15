@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,25 +118,24 @@ func TestTokenIssuerRejectsWrongIssuer(t *testing.T) {
 	}
 }
 
-func TestGoogleIDClaims(t *testing.T) {
-	// googleIDClaims only accepts asymmetric algorithms (RS256/ES256/PS256), so
-	// our HS256 session JWT must not be mistaken for a Google ID token.
+func TestVerifyGoogleIDTokenRejectsInvalid(t *testing.T) {
+	// HS256 session JWTs and empty tokens must never pass Google verification.
 	ti := newTestIssuer(t, accessTokenTTL)
 	token, _, err := ti.Issue("sub-999", "person@example.com", "")
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
-	if sub, email := googleIDClaims(token); sub != "" || email != "" {
-		t.Fatalf("expected empty claims for HS256 token, got sub=%q email=%q", sub, email)
+	if _, _, err := verifyGoogleIDToken(t.Context(), token, "client-id.apps.googleusercontent.com"); err == nil {
+		t.Fatal("expected HS256 token to fail Google id token verification")
 	}
-	if sub, email := googleIDClaims(""); sub != "" || email != "" {
-		t.Fatalf("expected empty claims for empty token")
+	if _, _, err := verifyGoogleIDToken(t.Context(), "", "client-id.apps.googleusercontent.com"); err == nil {
+		t.Fatal("expected empty token to fail")
 	}
-}
+	if _, _, err := verifyGoogleIDToken(t.Context(), "not-a-jwt", ""); err == nil {
+		t.Fatal("expected missing audience to fail")
+	}
 
-func TestGoogleIDClaimsExtractsRS256(t *testing.T) {
-	// Mint an RS256 JWT (as Google would) and confirm sub/email are extracted
-	// without signature verification.
+	// Self-signed RS256 is not trusted by Google JWKS.
 	key, err := rsa.GenerateKey(cryptorand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
@@ -144,15 +144,42 @@ func TestGoogleIDClaimsExtractsRS256(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSigner: %v", err)
 	}
-	claims := jwt.Claims{Subject: "google-sub", Audience: jwt.Audience{"aud"}}
-	extra := map[string]any{"email": "gmail@example.com"}
-	token, err := jwt.Signed(signer).Claims(claims).Claims(extra).Serialize()
+	claims := jwt.Claims{
+		Subject:  "google-sub",
+		Audience: jwt.Audience{"client-id.apps.googleusercontent.com"},
+		Expiry:   jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		Issuer:   "https://accounts.google.com",
+	}
+	extra := map[string]any{"email": "gmail@example.com", "email_verified": true}
+	fakeGoogle, err := jwt.Signed(signer).Claims(claims).Claims(extra).Serialize()
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
-	sub, email := googleIDClaims(token)
-	if sub != "google-sub" || email != "gmail@example.com" {
-		t.Fatalf("googleIDClaims = (%q, %q)", sub, email)
+	if _, _, err := verifyGoogleIDToken(t.Context(), fakeGoogle, "client-id.apps.googleusercontent.com"); err == nil {
+		t.Fatal("expected self-signed RS256 token to fail Google JWKS verification")
+	}
+}
+
+func TestTokenIssuerRejectsWrongAudience(t *testing.T) {
+	ti := newTestIssuer(t, accessTokenTTL)
+	// Mint a token whose aud does not match the issuer.
+	now := time.Now()
+	claims := SessionClaims{
+		Claims: jwt.Claims{
+			Issuer:    "https://emailmcp.ecg.co",
+			Subject:   "s",
+			Audience:  jwt.Audience{"https://evil.example"},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			Expiry:    jwt.NewNumericDate(now.Add(time.Hour)),
+		},
+	}
+	token, err := jwt.Signed(ti.signer).Claims(claims).Serialize()
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := ti.Verify(token); err == nil {
+		t.Fatal("expected wrong audience to be rejected")
 	}
 }
 
@@ -206,5 +233,12 @@ func TestAuthenticatorMiddlewareRejectsBadToken(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	// Client response must not leak verification error details.
+	if body := rec.Body.String(); strings.Contains(body, "parse jwt") || strings.Contains(body, "compact") {
+		t.Fatalf("response leaked error detail: %s", body)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "Unauthorized: Invalid token") {
+		t.Fatalf("body = %q", body)
 	}
 }

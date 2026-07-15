@@ -205,6 +205,8 @@ cmd_eks_apply() {
   export PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://emailmcp.ecg.co}"
   export APPLICATION_ID="${APPLICATION_ID:-default}"
   export EMAILMCP_LOG_LEVEL="${EMAILMCP_LOG_LEVEL:-info}"
+  # Empty allowlist means enforcement is off (any HTTPS redirect_uri accepted).
+  export OAUTH_REDIRECT_ALLOWLIST="${OAUTH_REDIRECT_ALLOWLIST:-}"
   export CERTIFICATE_ARN="$cert_arn"
 
   if [[ -z "${GOOGLE_CLIENT_ID}" ]]; then
@@ -241,9 +243,11 @@ cmd_eks_apply() {
         -e "s|\${APPLICATION_ID}|${APPLICATION_ID}|g" \
         -e "s|\${EMAILMCP_LOG_LEVEL}|${EMAILMCP_LOG_LEVEL}|g" \
         -e "s|\${PUBLIC_BASE_URL}|${PUBLIC_BASE_URL}|g" \
+        -e "s|\${OAUTH_REDIRECT_ALLOWLIST}|${OAUTH_REDIRECT_ALLOWLIST}|g" \
         "${k8s_dir}/configmap.yaml" | kubectl apply -n "${K8S_NAMESPACE}" -f -
 
     sed -e "s|\${GOOGLE_CLIENT_SECRET}|${GOOGLE_CLIENT_SECRET}|g" \
+        -e "s|\${EMAILMCP_JWT_SECRET}|${EMAILMCP_JWT_SECRET}|g" \
         "${k8s_dir}/secret.yaml" | kubectl apply -n "${K8S_NAMESPACE}" -f -
         
     sed -e "s|\${ECR_REPO_URL}|${ECR_REPO_URL}|g" \

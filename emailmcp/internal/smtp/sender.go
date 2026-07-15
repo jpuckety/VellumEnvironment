@@ -16,6 +16,12 @@ import (
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
+// Attachment size limits to prevent memory exhaustion via base64 payloads.
+const (
+	maxAttachmentBytes      = 10 << 20 // 10 MiB per attachment
+	maxTotalAttachmentBytes = 25 << 20 // 25 MiB total decoded attachments
+)
+
 // Config for SMTP sender.
 type Config struct {
 	DefaultTimeout time.Duration
@@ -82,10 +88,22 @@ func (s *Sender) SendEmail(ctx context.Context, acc *types.Account, input types.
 		e.HTML = []byte(input.HTML)
 	}
 
+	var totalAttach int
 	for _, att := range input.Attachments {
+		// Reject oversized base64 before decoding (base64 expands ~4/3).
+		if len(att.Data) > (maxAttachmentBytes*4)/3+4 {
+			return fmt.Errorf("attachment %s exceeds maximum size of %d bytes", att.Filename, maxAttachmentBytes)
+		}
 		data, err := base64.StdEncoding.DecodeString(att.Data)
 		if err != nil {
 			return fmt.Errorf("decode attachment %s: %w", att.Filename, err)
+		}
+		if len(data) > maxAttachmentBytes {
+			return fmt.Errorf("attachment %s exceeds maximum size of %d bytes", att.Filename, maxAttachmentBytes)
+		}
+		totalAttach += len(data)
+		if totalAttach > maxTotalAttachmentBytes {
+			return fmt.Errorf("total attachment size exceeds maximum of %d bytes", maxTotalAttachmentBytes)
 		}
 		ct := att.ContentType
 		if ct == "" {

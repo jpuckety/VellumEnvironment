@@ -18,7 +18,20 @@ func testOAuthServer(t *testing.T) *OAuthServer {
 	if err != nil {
 		t.Fatalf("NewTokenIssuer: %v", err)
 	}
-	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", tokens, nil)
+	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", tokens, nil, nil)
+	if err != nil {
+		t.Fatalf("NewOAuthServer: %v", err)
+	}
+	return o
+}
+
+func testOAuthServerWithAllowlist(t *testing.T, allowlist []string) *OAuthServer {
+	t.Helper()
+	tokens, err := NewTokenIssuer([]byte("test-signing-secret"), "https://emailmcp.ecg.co", accessTokenTTL)
+	if err != nil {
+		t.Fatalf("NewTokenIssuer: %v", err)
+	}
+	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", tokens, nil, allowlist)
 	if err != nil {
 		t.Fatalf("NewOAuthServer: %v", err)
 	}
@@ -75,6 +88,14 @@ func TestAuthServerMetadata(t *testing.T) {
 	if meta["registration_endpoint"] != "https://emailmcp.ecg.co/oauth/register" {
 		t.Errorf("registration_endpoint = %v", meta["registration_endpoint"])
 	}
+	// HS256 session tokens have no public JWKS; do not advertise Google's certs.
+	if _, ok := meta["jwks_uri"]; ok {
+		t.Errorf("jwks_uri should be omitted, got %v", meta["jwks_uri"])
+	}
+	methods, ok := meta["token_endpoint_auth_methods_supported"].([]any)
+	if !ok || len(methods) != 1 || methods[0] != "none" {
+		t.Errorf("token_endpoint_auth_methods_supported = %v, want [none]", methods)
+	}
 }
 
 func TestDynamicClientRegistration(t *testing.T) {
@@ -99,11 +120,29 @@ func TestDynamicClientRegistration(t *testing.T) {
 	if clientID == "" {
 		t.Fatal("expected client_id")
 	}
+	if resp["token_endpoint_auth_method"] != "none" {
+		t.Errorf("token_endpoint_auth_method = %v, want none", resp["token_endpoint_auth_method"])
+	}
 	o.mu.Lock()
 	_, ok := o.clients[clientID]
 	o.mu.Unlock()
 	if !ok {
 		t.Fatal("client not stored")
+	}
+}
+
+func TestDynamicClientRegistrationRejectsClientSecret(t *testing.T) {
+	o := testOAuthServer(t)
+	mux := http.NewServeMux()
+	o.Mount(mux)
+
+	body := `{"client_name":"Conf","redirect_uris":["http://127.0.0.1:54321/callback"],"token_endpoint_auth_method":"client_secret_basic"}`
+	req := httptest.NewRequest(http.MethodPost, "https://emailmcp.ecg.co/oauth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -245,6 +284,7 @@ func TestTokenRejectsMissingFields(t *testing.T) {
 }
 
 func TestIsAllowedRedirectURI(t *testing.T) {
+	// Empty allowlist → not enforced; any HTTPS host with a name is allowed.
 	cases := []struct {
 		uri  string
 		want bool
@@ -252,6 +292,7 @@ func TestIsAllowedRedirectURI(t *testing.T) {
 		{"http://127.0.0.1:1234/cb", true},
 		{"http://localhost:8080/", true},
 		{"https://app.example.com/oauth/cb", true},
+		{"https://evil.example/cb", true}, // open when allowlist empty
 		{"cursor://oauth/callback", true},
 		{"javascript:alert(1)", false},
 		{"data:text/html,hi", false},
@@ -259,8 +300,68 @@ func TestIsAllowedRedirectURI(t *testing.T) {
 		{"http://evil.com/cb", false},
 	}
 	for _, tc := range cases {
-		if got := isAllowedRedirectURI(tc.uri); got != tc.want {
-			t.Errorf("isAllowedRedirectURI(%q) = %v, want %v", tc.uri, got, tc.want)
+		if got := isAllowedRedirectURI(tc.uri, nil); got != tc.want {
+			t.Errorf("isAllowedRedirectURI(%q, nil) = %v, want %v", tc.uri, got, tc.want)
 		}
+	}
+}
+
+func TestIsAllowedRedirectURIWithAllowlist(t *testing.T) {
+	allow := []string{
+		"app.example.com",
+		"*.corp.example.com",
+		"https://web.example.com/oauth/cb",
+	}
+	cases := []struct {
+		uri  string
+		want bool
+	}{
+		// Always allowed (desktop MCP)
+		{"http://127.0.0.1:1234/cb", true},
+		{"http://localhost:8080/", true},
+		{"cursor://oauth/callback", true},
+		// Host allowlist
+		{"https://app.example.com/any/path", true},
+		{"https://APP.EXAMPLE.COM/x", true},
+		{"https://evil.example/cb", false},
+		// Wildcard subdomain
+		{"https://a.corp.example.com/cb", true},
+		{"https://b.c.corp.example.com/cb", true},
+		{"https://corp.example.com/cb", false}, // *.corp does not match apex
+		// URI prefix allowlist
+		{"https://web.example.com/oauth/cb", true},
+		{"https://web.example.com/oauth/cb/extra", true},
+		{"https://web.example.com/other", false},
+		{"https://web.example.com/", false},
+	}
+	for _, tc := range cases {
+		if got := isAllowedRedirectURI(tc.uri, allow); got != tc.want {
+			t.Errorf("isAllowedRedirectURI(%q, allow) = %v, want %v", tc.uri, got, tc.want)
+		}
+	}
+}
+
+func TestRegisterRejectsHTTPSOutsideAllowlist(t *testing.T) {
+	o := testOAuthServerWithAllowlist(t, []string{"trusted.example.com"})
+	mux := http.NewServeMux()
+	o.Mount(mux)
+
+	body := `{"client_name":"Evil","redirect_uris":["https://evil.example/cb"]}`
+	req := httptest.NewRequest(http.MethodPost, "https://emailmcp.ecg.co/oauth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// Trusted host still registers.
+	body = `{"client_name":"Good","redirect_uris":["https://trusted.example.com/cb"]}`
+	req = httptest.NewRequest(http.MethodPost, "https://emailmcp.ecg.co/oauth/register", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("trusted register status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }

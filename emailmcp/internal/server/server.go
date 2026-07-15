@@ -80,9 +80,16 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		if cfg.GoogleClientSecret == "" {
 			return nil, errors.New("GOOGLE_CLIENT_SECRET is required for HTTP mode OAuth")
 		}
-		oauth, err = NewOAuthServer(cfg.PublicBaseURL, cfg.GoogleClientID, cfg.GoogleClientSecret, tokens, logger)
+		oauth, err = NewOAuthServer(cfg.PublicBaseURL, cfg.GoogleClientID, cfg.GoogleClientSecret, tokens, logger, cfg.OAuthRedirectAllowlist)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create oauth server: %w", err)
+		}
+		if len(cfg.OAuthRedirectAllowlist) > 0 {
+			logger.Info("oauth HTTPS redirect allowlist enforced",
+				"entries", len(cfg.OAuthRedirectAllowlist),
+			)
+		} else {
+			logger.Warn("oauth HTTPS redirect allowlist empty; any HTTPS redirect_uri is accepted (set OAUTH_REDIRECT_ALLOWLIST to enforce)")
 		}
 	}
 

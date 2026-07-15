@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"google.golang.org/api/idtoken"
 )
 
 const (
@@ -107,29 +109,45 @@ func (ti *TokenIssuer) Verify(token string) (*SessionClaims, error) {
 	if err := parsed.Claims(ti.key, &claims); err != nil {
 		return nil, fmt.Errorf("verify jwt: %w", err)
 	}
-	if err := claims.Validate(jwt.Expected{Issuer: ti.issuer, Time: time.Now()}); err != nil {
+	// Require issuer, audience (set to issuer at mint time), and time validity.
+	if err := claims.Validate(jwt.Expected{
+		Issuer:      ti.issuer,
+		AnyAudience: jwt.Audience{ti.issuer},
+		Time:        time.Now(),
+	}); err != nil {
 		return nil, fmt.Errorf("invalid jwt claims: %w", err)
 	}
 	return &claims, nil
 }
 
-// googleIDClaims extracts the subject and email from a Google ID token without
-// verifying its signature. The token is trusted because it was obtained directly
-// from Google during the authorization code exchange (over TLS).
-func googleIDClaims(idToken string) (subject, email string) {
-	if idToken == "" {
-		return "", ""
+// verifyGoogleIDToken cryptographically validates a Google-issued ID token
+// (signature via Google JWKS, audience, issuer, expiry) and returns subject/email.
+func verifyGoogleIDToken(ctx context.Context, rawToken, audience string) (subject, email string, err error) {
+	if rawToken == "" {
+		return "", "", fmt.Errorf("empty id token")
 	}
-	parsed, err := jwt.ParseSigned(idToken, []jose.SignatureAlgorithm{jose.RS256, jose.ES256, jose.PS256})
+	if audience == "" {
+		return "", "", fmt.Errorf("audience (GOOGLE_CLIENT_ID) is required")
+	}
+	payload, err := idtoken.Validate(ctx, rawToken, audience)
 	if err != nil {
-		return "", ""
+		return "", "", fmt.Errorf("google id token validation failed: %w", err)
 	}
-	var c struct {
-		Subject string `json:"sub"`
-		Email   string `json:"email"`
+	if payload.Subject == "" {
+		return "", "", fmt.Errorf("google id token missing sub claim")
 	}
-	if err := parsed.UnsafeClaimsWithoutVerification(&c); err != nil {
-		return "", ""
+	if v, ok := payload.Claims["email_verified"]; ok {
+		switch verified := v.(type) {
+		case bool:
+			if !verified {
+				return "", "", fmt.Errorf("google email is not verified")
+			}
+		case string:
+			if verified != "true" {
+				return "", "", fmt.Errorf("google email is not verified")
+			}
+		}
 	}
-	return c.Subject, c.Email
+	email, _ = payload.Claims["email"].(string)
+	return payload.Subject, email, nil
 }

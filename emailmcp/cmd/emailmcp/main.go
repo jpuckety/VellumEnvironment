@@ -74,11 +74,19 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		handler := srv.HTTPHandler()
+		// Cap request body size to limit memory use from large MCP payloads
+		// (e.g. base64 attachments). Individual attachment decode is also capped.
+		const maxRequestBody = 32 << 20 // 32 MiB
+		handler := http.MaxBytesHandler(srv.HTTPHandler(), maxRequestBody)
 
 		httpServer := &http.Server{
-			Addr:    cfg.ListenAddr,
-			Handler: handler,
+			Addr:              cfg.ListenAddr,
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			WriteTimeout:      120 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    1 << 20, // 1 MiB
 		}
 
 		// Graceful shutdown

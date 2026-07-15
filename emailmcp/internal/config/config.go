@@ -45,6 +45,12 @@ type Config struct {
 	// Google sign-in. When empty, a random key is generated at startup (sessions
 	// will not survive a restart or span multiple instances).
 	JWTSecret string
+	// OAuthRedirectAllowlist restricts HTTPS OAuth redirect_uris when non-empty.
+	// Entries are comma-separated hostnames (example.com, *.example.com) or
+	// https origins/URIs. Empty means the allowlist is not enforced (any HTTPS
+	// host is still accepted subject to other redirect rules). Loopback HTTP and
+	// custom schemes are always allowed for desktop MCP clients.
+	OAuthRedirectAllowlist []string
 }
 
 // Load reads configuration from environment with sensible defaults.
@@ -62,6 +68,7 @@ func Load() (*Config, error) {
 		GoogleClientSecret:     getEnv("GOOGLE_CLIENT_SECRET", ""),
 		PublicBaseURL:          strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/"),
 		JWTSecret:              getEnv("EMAILMCP_JWT_SECRET", ""),
+		OAuthRedirectAllowlist: parseCSVEnv("OAUTH_REDIRECT_ALLOWLIST"),
 	}
 
 	if cfg.IMAPMaxConnsPerAccount < 1 {
@@ -86,6 +93,8 @@ func Load() (*Config, error) {
 		"google_client_secret_set", cfg.GoogleClientSecret != "",
 		"public_base_url", cfg.PublicBaseURL,
 		"jwt_secret_set", cfg.JWTSecret != "",
+		"oauth_redirect_allowlist_enforced", len(cfg.OAuthRedirectAllowlist) > 0,
+		"oauth_redirect_allowlist_entries", len(cfg.OAuthRedirectAllowlist),
 		"aws_region", os.Getenv("AWS_REGION"),
 	)
 
@@ -160,6 +169,26 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseCSVEnv splits a comma-separated env var into trimmed non-empty entries.
+func parseCSVEnv(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func getEnvInt(key string, def int) int {

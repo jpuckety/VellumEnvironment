@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -109,7 +110,9 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		token := parts[1]
 		claims, err := a.tokens.Verify(token)
 		if err != nil {
-			a.writeUnauthorized(w, r, "Unauthorized: Invalid token: "+err.Error())
+			// Log details server-side only; never echo verification errors to clients.
+			slog.Warn("session jwt verification failed", "error", err, "remote", r.RemoteAddr)
+			a.writeUnauthorized(w, r, "Unauthorized: Invalid token")
 			return
 		}
 

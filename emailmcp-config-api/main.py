@@ -80,15 +80,21 @@ def handler(event, context):
                          '(expected X-Google-ID-Token or Authorization: Bearer)'
             })
 
-        google_client_id = os.environ.get('GOOGLE_CLIENT_ID')
+        google_client_id = (os.environ.get('GOOGLE_CLIENT_ID') or '').strip()
+        if not google_client_id:
+            # Fail closed: google-auth skips audience checks when audience is None/empty.
+            print('ERROR: GOOGLE_CLIENT_ID is not set; refusing authenticated requests')
+            return response(500, {'error': 'Server misconfigured'})
 
         try:
-            # Verify signature, expiry, and audience (GOOGLE_CLIENT_ID when set).
+            # Verify signature, expiry, and audience (requires non-empty GOOGLE_CLIENT_ID).
             id_info = id_token.verify_oauth2_token(token, google_requests.Request(), google_client_id)
             user_id = id_info['sub']
             # email = id_info['email']
         except Exception as e:
-            return response(401, {'error': f'Invalid token: {str(e)}'})
+            # Log details server-side only; never echo verification errors to clients.
+            print(f'Invalid Google ID token: {e}')
+            return response(401, {'error': 'Invalid token'})
 
         # 2. Parse Path
         parts = path.strip('/').split('/')
@@ -128,7 +134,7 @@ def handler(event, context):
         print(f"Error: {str(e)}")
         import traceback
         traceback.print_exc()
-        return response(500, {'error': f'Internal server error: {str(e)}'})
+        return response(500, {'error': 'Internal server error'})
 
 
 def strip_secrets(item):
@@ -185,7 +191,8 @@ def list_configs(app_id, user_id):
         safe_items = [strip_secrets(item) for item in items]
         return response(200, safe_items)
     except ClientError as e:
-        return response(500, {'error': str(e)})
+        print(f"list_configs error: {e}")
+        return response(500, {'error': 'Internal server error'})
 
 
 def get_config(app_id, user_id, account_id):
@@ -214,7 +221,8 @@ def get_config(app_id, user_id, account_id):
         
         return response(200, out)
     except ClientError as e:
-        return response(500, {'error': str(e)})
+        print(f"get_config error: {e}")
+        return response(500, {'error': 'Internal server error'})
 
 
 def put_config(app_id, user_id, account_id, body):
@@ -258,7 +266,8 @@ def put_config(app_id, user_id, account_id, body):
                 )
                 secret_arn = secret_res['ARN']
         except ClientError as e:
-            return response(500, {'error': f"Failed to save secret: {str(e)}"})
+            print(f"Failed to save secret: {e}")
+            return response(500, {'error': 'Internal server error'})
     else:
         # Password-less update: preserve existing secretArn from the stored item.
         try:
@@ -270,7 +279,8 @@ def put_config(app_id, user_id, account_id, body):
                 if legacy.get('Item') and legacy['Item'].get('secretArn'):
                     secret_arn = legacy['Item']['secretArn']
         except ClientError as e:
-            return response(500, {'error': str(e)})
+            print(f"put_config load existing error: {e}")
+            return response(500, {'error': 'Internal server error'})
 
         # If only smtp_password is being rotated, merge into the existing secret.
         if smtp_password is not None and secret_arn:
@@ -285,7 +295,8 @@ def put_config(app_id, user_id, account_id, body):
                     SecretString=json.dumps(secret_doc, cls=DynamoJSONEncoder)
                 )
             except ClientError as e:
-                return response(500, {'error': f"Failed to update smtp password: {str(e)}"})
+                print(f"Failed to update smtp password: {e}")
+                return response(500, {'error': 'Internal server error'})
 
     # Allowlist non-secret fields only — never take secretArn or passwords from the client.
     item = {k: v for k, v in body.items() if k in ALLOWED_CONFIG_FIELDS}
@@ -304,7 +315,8 @@ def put_config(app_id, user_id, account_id, body):
             'applicationId': app_id,
         })
     except ClientError as e:
-        return response(500, {'error': str(e)})
+        print(f"put_config dynamodb error: {e}")
+        return response(500, {'error': 'Internal server error'})
 
 
 def delete_config(app_id, user_id, account_id):
@@ -318,7 +330,8 @@ def delete_config(app_id, user_id, account_id):
             pass
         return response(200, {'message': 'Config deleted successfully'})
     except ClientError as e:
-        return response(500, {'error': str(e)})
+        print(f"delete_config error: {e}")
+        return response(500, {'error': 'Internal server error'})
 
 
 def extract_google_token(headers):

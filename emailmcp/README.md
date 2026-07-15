@@ -155,7 +155,8 @@ See `.env.example`. Key variables for the MCP server:
 | `GOOGLE_CLIENT_ID` | Yes | Google OAuth2 Client ID for ID token verification. |
 | `GOOGLE_CLIENT_SECRET` | Yes (HTTP) | Google client secret for the MCP OAuth authorize/token proxy. |
 | `PUBLIC_BASE_URL` | Yes (HTTP) | Public origin (issuer + OAuth redirect base), e.g. `https://emailmcp.ecg.co`. |
-| `EMAILMCP_JWT_SECRET` | No (HTTP) | Signing key for the session JWTs issued after Google sign-in (1h access token + 7d refresh token). Set a strong, stable value in production; a random key is generated when unset. |
+| `EMAILMCP_JWT_SECRET` | Yes (EKS/HTTP prod) | Signing key for the session JWTs issued after Google sign-in (1h access token + 7d refresh token). Required for stable sessions across restarts/replicas; passed to the pod via `deploy/eks/secret.yaml`. A random key is generated when unset (local-only). |
+| `OAUTH_REDIRECT_ALLOWLIST` | No | Comma-separated HTTPS OAuth `redirect_uri` allowlist (host, `*.host`, or `https://…` URI). **Empty = not enforced** (any HTTPS host allowed). Loopback HTTP and custom schemes always allowed. Passed to EKS via ConfigMap. |
 | `APPLICATION_ID` | No | Application partition key (default: `default`). |
 | `EMAILMCP_LOG_LEVEL` | No | `debug`, `info` (default), `warn`, `error`. |
 | `EMAILMCP_TRANSPORT` | No | `http` (default) or `stdio`. |
