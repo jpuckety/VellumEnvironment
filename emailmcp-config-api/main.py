@@ -12,6 +12,32 @@ secretsmanager = boto3.client('secretsmanager')
 TABLE_NAME = os.environ.get('TABLE_NAME')
 table = dynamodb.Table(TABLE_NAME)
 
+# DynamoDB fields accepted from clients. Credentials and secret ARNs are never
+# taken from the request body — they are managed server-side only.
+ALLOWED_CONFIG_FIELDS = frozenset({
+    'name',
+    'imap_host',
+    'imap_port',
+    'imap_username',
+    'imap_use_tls',
+    'smtp_host',
+    'smtp_port',
+    'smtp_username',
+    'smtp_use_tls',
+    'from_address',
+    'created_at',
+    'updated_at',
+})
+
+# Keys that must never appear in list responses or DynamoDB items.
+SECRET_RESPONSE_KEYS = frozenset({
+    'password',
+    'imap_password',
+    'smtp_password',
+    'secretArn',
+    'secret_arn',
+})
+
 
 class DynamoJSONEncoder(json.JSONEncoder):
     """Serialize DynamoDB AttributeValue types that boto3 returns as Decimal/set."""
@@ -104,7 +130,45 @@ def handler(event, context):
         traceback.print_exc()
         return response(500, {'error': f'Internal server error: {str(e)}'})
 
+
+def strip_secrets(item):
+    """Return a shallow copy of item without credential material or secret ARNs."""
+    if not item:
+        return item
+    return {k: v for k, v in item.items() if k not in SECRET_RESPONSE_KEYS}
+
+
+def load_secret_passwords(secret_arn):
+    """Load IMAP/SMTP passwords from a Secrets Manager document.
+
+    Secret document shape:
+      {
+        "password": "<imap password>",       # legacy + primary IMAP key
+        "imap_password": "<imap password>",  # optional explicit key
+        "smtp_password": "<smtp password>"   # optional; falls back to IMAP password
+      }
+    """
+    if not secret_arn:
+        return None, None
+    try:
+        secret_res = secretsmanager.get_secret_value(SecretId=secret_arn)
+        secret_json = json.loads(secret_res['SecretString'])
+    except ClientError as e:
+        print(f"Error fetching secret: {str(e)}")
+        return None, None
+
+    imap_password = (
+        secret_json.get('imap_password')
+        or secret_json.get('password')
+    )
+    smtp_password = secret_json.get('smtp_password')
+    if not smtp_password:
+        smtp_password = imap_password
+    return imap_password, smtp_password
+
+
 def list_configs(app_id, user_id):
+    """List account configs without hydrating or returning secrets."""
     try:
         # Query all accounts for this user. SK format is "userId#accountId".
         res = table.query(
@@ -117,20 +181,12 @@ def list_configs(app_id, user_id):
         if legacy_res.get('Item'):
             items.append(legacy_res.get('Item'))
 
-        # Fetch passwords for all items (if secrets exist)
-        for item in items:
-            secret_arn = item.get('secretArn')
-            if secret_arn:
-                try:
-                    secret_res = secretsmanager.get_secret_value(SecretId=secret_arn)
-                    secret_json = json.loads(secret_res['SecretString'])
-                    item['password'] = secret_json.get('password')
-                except ClientError:
-                    item['password'] = None
-        
-        return response(200, items)
+        # Never fetch Secrets Manager or echo passwords/secret ARNs in list responses.
+        safe_items = [strip_secrets(item) for item in items]
+        return response(200, safe_items)
     except ClientError as e:
         return response(500, {'error': str(e)})
+
 
 def get_config(app_id, user_id, account_id):
     try:
@@ -148,60 +204,108 @@ def get_config(app_id, user_id, account_id):
             return response(404, {'error': 'Config not found'})
         
         secret_arn = item.get('secretArn')
-        password = None
-        if secret_arn:
-            try:
-                secret_res = secretsmanager.get_secret_value(SecretId=secret_arn)
-                secret_json = json.loads(secret_res['SecretString'])
-                password = secret_json.get('password')
-            except ClientError as e:
-                print(f"Error fetching secret: {str(e)}")
+        imap_password, smtp_password = load_secret_passwords(secret_arn)
+
+        # Return a client-safe base item, then attach passwords only for single-get
+        # (EmailMCP needs them to dial IMAP/SMTP). secretArn is not echoed.
+        out = strip_secrets(item)
+        out['password'] = imap_password
+        out['smtp_password'] = smtp_password
         
-        item['password'] = password
-        
-        return response(200, item)
+        return response(200, out)
     except ClientError as e:
         return response(500, {'error': str(e)})
 
+
 def put_config(app_id, user_id, account_id, body):
-    # body should contain imapHost, imapPort, imapUsername, and password
+    """Store non-secret config in DynamoDB; IMAP+SMTP passwords in one secret document."""
+    if not isinstance(body, dict):
+        return response(400, {'error': 'body must be a JSON object'})
+
+    # Extract credentials; never persist them in DynamoDB.
     password = body.pop('password', None)
-    
+    if password is None:
+        password = body.pop('imap_password', None)
+    smtp_password = body.pop('smtp_password', None)
+    # Ignore any client-supplied secret handles / credential aliases.
+    body.pop('secretArn', None)
+    body.pop('secret_arn', None)
+
     sk = f"{user_id}#{account_id}"
     secret_id = f"emailmcp/imap/{app_id}/{user_id}/{account_id}"
     secret_arn = None
-    
+
     if password:
+        # Single secret document holds both passwords.
+        secret_doc = {
+            'password': password,
+            'imap_password': password,
+            'smtp_password': smtp_password if smtp_password else password,
+        }
         try:
             try:
                 secretsmanager.put_secret_value(
                     SecretId=secret_id,
-                    SecretString=json.dumps({'password': password}, cls=DynamoJSONEncoder)
+                    SecretString=json.dumps(secret_doc, cls=DynamoJSONEncoder)
                 )
                 secret_res = secretsmanager.describe_secret(SecretId=secret_id)
                 secret_arn = secret_res['ARN']
             except secretsmanager.exceptions.ResourceNotFoundException:
                 secret_res = secretsmanager.create_secret(
                     Name=secret_id,
-                    SecretString=json.dumps({'password': password}, cls=DynamoJSONEncoder),
-                    Description=f"IMAP password for {user_id}/{account_id} in {app_id}"
+                    SecretString=json.dumps(secret_doc, cls=DynamoJSONEncoder),
+                    Description=f"IMAP/SMTP passwords for {user_id}/{account_id} in {app_id}"
                 )
                 secret_arn = secret_res['ARN']
         except ClientError as e:
             return response(500, {'error': f"Failed to save secret: {str(e)}"})
+    else:
+        # Password-less update: preserve existing secretArn from the stored item.
+        try:
+            existing = table.get_item(Key={'applicationId': app_id, 'userId': sk})
+            if existing.get('Item') and existing['Item'].get('secretArn'):
+                secret_arn = existing['Item']['secretArn']
+            elif account_id == 'default':
+                legacy = table.get_item(Key={'applicationId': app_id, 'userId': user_id})
+                if legacy.get('Item') and legacy['Item'].get('secretArn'):
+                    secret_arn = legacy['Item']['secretArn']
+        except ClientError as e:
+            return response(500, {'error': str(e)})
 
-    body['applicationId'] = app_id
-    body['userId'] = sk
-    # Store account_id in the body too for convenience
-    body['id'] = account_id
+        # If only smtp_password is being rotated, merge into the existing secret.
+        if smtp_password is not None and secret_arn:
+            try:
+                secret_res = secretsmanager.get_secret_value(SecretId=secret_arn)
+                secret_doc = json.loads(secret_res['SecretString'])
+                secret_doc['smtp_password'] = smtp_password
+                if 'password' not in secret_doc and 'imap_password' in secret_doc:
+                    secret_doc['password'] = secret_doc['imap_password']
+                secretsmanager.put_secret_value(
+                    SecretId=secret_id,
+                    SecretString=json.dumps(secret_doc, cls=DynamoJSONEncoder)
+                )
+            except ClientError as e:
+                return response(500, {'error': f"Failed to update smtp password: {str(e)}"})
+
+    # Allowlist non-secret fields only — never take secretArn or passwords from the client.
+    item = {k: v for k, v in body.items() if k in ALLOWED_CONFIG_FIELDS}
+    item['applicationId'] = app_id
+    item['userId'] = sk
+    item['id'] = account_id
     if secret_arn:
-        body['secretArn'] = secret_arn
-    
+        item['secretArn'] = secret_arn
+
     try:
-        table.put_item(Item=body)
-        return response(200, {'message': 'Config saved successfully', 'userId': user_id, 'accountId': account_id, 'applicationId': app_id})
+        table.put_item(Item=item)
+        return response(200, {
+            'message': 'Config saved successfully',
+            'userId': user_id,
+            'accountId': account_id,
+            'applicationId': app_id,
+        })
     except ClientError as e:
         return response(500, {'error': str(e)})
+
 
 def delete_config(app_id, user_id, account_id):
     sk = f"{user_id}#{account_id}"
@@ -215,6 +319,7 @@ def delete_config(app_id, user_id, account_id):
         return response(200, {'message': 'Config deleted successfully'})
     except ClientError as e:
         return response(500, {'error': str(e)})
+
 
 def extract_google_token(headers):
     """Return the Google ID token from request headers, or empty string.

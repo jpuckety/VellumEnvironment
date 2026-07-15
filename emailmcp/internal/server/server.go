@@ -14,6 +14,7 @@ import (
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
 	imapmgr "github.com/jpuckett/EmailMCP/emailmcp/internal/imap"
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/netutil"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/smtp"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
@@ -301,13 +302,14 @@ type AddAccountInput struct {
 	IMAPPort     int    `json:"imap_port" jsonschema:"default:993"`
 	IMAPUsername string `json:"imap_username"`
 	IMAPPassword string `json:"imap_password" jsonschema:"The IMAP password (stored in Secrets Manager)"`
-	IMAPUseTLS   bool   `json:"imap_use_tls" jsonschema:"default:true"`
+	// Pointer so JSON omission honors default true (zero-value bool would be false).
+	IMAPUseTLS *bool `json:"imap_use_tls,omitempty" jsonschema:"default:true"`
 
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port" jsonschema:"default:587"`
 	SMTPUsername string `json:"smtp_username"`
 	SMTPPassword string `json:"smtp_password" jsonschema:"The SMTP password; defaults to IMAP password when empty"`
-	SMTPUseTLS   bool   `json:"smtp_use_tls" jsonschema:"default:true"`
+	SMTPUseTLS   *bool  `json:"smtp_use_tls,omitempty" jsonschema:"default:true"`
 
 	FromAddress string `json:"from_address,omitempty"`
 }
@@ -382,6 +384,22 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, nil, errors.New("imap_password is required")
 	}
 
+	imapUseTLS := boolDefault(in.IMAPUseTLS, true)
+	smtpUseTLS := boolDefault(in.SMTPUseTLS, true)
+
+	if err := netutil.ValidatePublicHost(in.IMAPHost); err != nil {
+		return nil, nil, fmt.Errorf("imap_host not allowed: %w", err)
+	}
+	if err := netutil.ValidatePublicHost(in.SMTPHost); err != nil {
+		return nil, nil, fmt.Errorf("smtp_host not allowed: %w", err)
+	}
+	if err := netutil.RequireTLSUnlessLocalhost(in.IMAPHost, imapUseTLS, "IMAP"); err != nil {
+		return nil, nil, err
+	}
+	if err := netutil.RequireTLSUnlessLocalhost(in.SMTPHost, smtpUseTLS, "SMTP"); err != nil {
+		return nil, nil, err
+	}
+
 	smtpUser := in.SMTPUsername
 	if smtpUser == "" {
 		smtpUser = in.IMAPUsername
@@ -402,17 +420,18 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 
 	acc := &types.Account{
 		ID:           accountID,
+		OwnerUserID:  user.Subject,
 		Name:         in.Name,
 		IMAPHost:     in.IMAPHost,
 		IMAPPort:     defaultPort(in.IMAPPort, 993),
 		IMAPUsername: in.IMAPUsername,
 		IMAPPassword: in.IMAPPassword,
-		IMAPUseTLS:   defaultBool(in.IMAPUseTLS, true),
+		IMAPUseTLS:   imapUseTLS,
 		SMTPHost:     in.SMTPHost,
 		SMTPPort:     defaultPort(in.SMTPPort, 587),
 		SMTPUsername: smtpUser,
 		SMTPPassword: smtpPass,
-		SMTPUseTLS:   defaultBool(in.SMTPUseTLS, true),
+		SMTPUseTLS:   smtpUseTLS,
 		FromAddress:  in.FromAddress,
 	}
 
@@ -420,7 +439,12 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, nil, fmt.Errorf("store account via config api: %w", err)
 	}
 
-	s.logger.Info("account added", "id", acc.ID, "name", acc.Name)
+	// Drop any existing pool so credential/host changes take effect immediately.
+	if s.imapMgr != nil {
+		s.imapMgr.DropPool(user.Subject, acc.ID)
+	}
+
+	s.logger.Info("account added", "id", acc.ID, "name", acc.Name, "owner", user.Subject)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Account saved successfully. ID: %s", acc.ID)}},
@@ -470,7 +494,11 @@ func (s *Server) removeEmailAccount(ctx context.Context, req *mcp.CallToolReques
 		}
 		return nil, nil, err
 	}
-	s.logger.Info("account removed", "id", in.AccountID)
+	// Close any live IMAP connections for this tenant account.
+	if s.imapMgr != nil {
+		s.imapMgr.DropPool(user.Subject, in.AccountID)
+	}
+	s.logger.Info("account removed", "id", in.AccountID, "owner", user.Subject)
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Account removed"}}}, nil, nil
 }
 
@@ -631,11 +659,33 @@ func (s *Server) getAccount(ctx context.Context, accountID string) (*types.Accou
 	// Try to find the exact match by ID if multiple are returned.
 	for _, acc := range accs {
 		if acc.ID == accountID {
+			// Bind ownership for pool isolation and re-validate host/TLS policy.
+			acc.OwnerUserID = userInfo.Subject
+			if err := validateAccountEndpoints(acc); err != nil {
+				return nil, err
+			}
 			return acc, nil
 		}
 	}
 
 	return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
+}
+
+// validateAccountEndpoints enforces SSRF and TLS policy on stored config before dial.
+func validateAccountEndpoints(acc *types.Account) error {
+	if err := netutil.ValidatePublicHost(acc.IMAPHost); err != nil {
+		return fmt.Errorf("imap_host not allowed: %w", err)
+	}
+	if err := netutil.ValidatePublicHost(acc.SMTPHost); err != nil {
+		return fmt.Errorf("smtp_host not allowed: %w", err)
+	}
+	if err := netutil.RequireTLSUnlessLocalhost(acc.IMAPHost, acc.IMAPUseTLS, "IMAP"); err != nil {
+		return err
+	}
+	if err := netutil.RequireTLSUnlessLocalhost(acc.SMTPHost, acc.SMTPUseTLS, "SMTP"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func defaultPort(p, def int) int {
@@ -645,10 +695,13 @@ func defaultPort(p, def int) int {
 	return def
 }
 
-func defaultBool(b, def bool) bool {
-	// The struct will have zero value false; we interpret explicit setting.
-	// For simplicity, always use the value passed (user can set false).
-	return b
+// boolDefault returns *b when set, otherwise def. Used so omitted JSON bools
+// honor schema defaults (e.g. imap_use_tls / smtp_use_tls default true).
+func boolDefault(b *bool, def bool) bool {
+	if b == nil {
+		return def
+	}
+	return *b
 }
 
 func parseDate(s string) (time.Time, error) {

@@ -62,14 +62,15 @@ There is **no local SQLite or other local account store**. Each authenticated Go
 `internal/imap/pool.go` maintains a per-account pool of `*imapclient.Client` connections. The pattern for every IMAP operation:
 
 ```go
-conn, err := m.Acquire(ctx, acc)
+conn, err := m.Acquire(ctx, acc) // acc.OwnerUserID must be set (tenant isolation)
 hadErr := false
-defer func() { m.Release(acc.ID, conn, hadErr) }()
+defer func() { m.Release(acc, conn, hadErr) }()
 // ... use conn.client ...
 // on error: hadErr = true (connection is discarded, not returned to pool)
+// on remove_email_account / credential change: m.DropPool(ownerUserID, accountID)
 ```
 
-Connections track `lastSelected` folder to reduce churn but always re-`SELECT` before operations. Always use UID-based operations (`UIDSearch`, `UIDSetNum`) — never sequence numbers.
+Pools are keyed by `(OwnerUserID, accountID)` so two users with the same account slug cannot share connections. Connections track `lastSelected` folder to reduce churn but always re-`SELECT` before operations. Always use UID-based operations (`UIDSearch`, `UIDSetNum`) — never sequence numbers. IMAP/SMTP hosts must resolve to public addresses (private/link-local/metadata ranges are blocked). Non-TLS is refused except for explicit localhost (which is still blocked by host validation in normal use).
 
 ### Credential Handling
 

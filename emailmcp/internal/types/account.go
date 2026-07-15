@@ -11,11 +11,17 @@ type Account struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
+	// OwnerUserID is the authenticated Google subject that owns this account.
+	// It is set by EmailMCP after Config API fetch and is never serialized to
+	// storage. IMAP connection pools are keyed by (OwnerUserID, ID) so tenants
+	// cannot share pools when account IDs collide.
+	OwnerUserID string `json:"-"`
+
 	// IMAP settings
 	IMAPHost     string `json:"imap_host"`
 	IMAPPort     int    `json:"imap_port"`
 	IMAPUsername string `json:"imap_username"`
-	// IMAPPassword comes from the Config API (JSON field "password").
+	// IMAPPassword comes from the Config API secret document (JSON field "password").
 	IMAPPassword string `json:"password,omitempty"`
 	IMAPUseTLS   bool   `json:"imap_use_tls"`
 
@@ -23,7 +29,7 @@ type Account struct {
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port"`
 	SMTPUsername string `json:"smtp_username"`
-	// SMTPPassword is optional; when empty, IMAPPassword is used.
+	// SMTPPassword comes from the Config API secret document; when empty, IMAPPassword is used.
 	SMTPPassword string `json:"smtp_password,omitempty"`
 	SMTPUseTLS   bool   `json:"smtp_use_tls"`
 

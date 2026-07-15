@@ -11,6 +11,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/netutil"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
@@ -35,8 +36,10 @@ type Manager struct {
 }
 
 type accountPool struct {
+	poolKey   string // ownerUserID + "\x00" + accountID
+	ownerID   string
 	accountID string
-	imapCfg   imapAccountConfig // decrypted on dial
+	imapCfg   imapAccountConfig // plaintext only for the life of the pool
 
 	mu       sync.Mutex
 	idle     []*pooledConn
@@ -45,6 +48,12 @@ type accountPool struct {
 	idleT    time.Duration
 	logger   *slog.Logger
 	closed   bool
+}
+
+// PoolKey returns the map key for a user's account pool.
+// Tenants are isolated even when account IDs collide (e.g. both use "default").
+func PoolKey(ownerUserID, accountID string) string {
+	return ownerUserID + "\x00" + accountID
 }
 
 type pooledConn struct {
@@ -81,21 +90,45 @@ func NewManager(cfg Config) *Manager {
 
 // getOrCreatePool returns the pool for an account.
 func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
+	if acc == nil {
+		return nil, errors.New("account is required")
+	}
+	if acc.OwnerUserID == "" {
+		return nil, errors.New("account owner user id is required for imap pool isolation")
+	}
+	if acc.ID == "" {
+		return nil, errors.New("account id is required")
+	}
+
+	key := PoolKey(acc.OwnerUserID, acc.ID)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if p, ok := m.pools[acc.ID]; ok {
+	if p, ok := m.pools[key]; ok {
 		return p, nil
 	}
 
-	logger := m.cfg.Logger.With("op", "get_or_create_pool", "account_id", acc.ID)
+	logger := m.cfg.Logger.With(
+		"op", "get_or_create_pool",
+		"owner_user_id", acc.OwnerUserID,
+		"account_id", acc.ID,
+	)
 	logger.Debug("creating new imap pool", "host", acc.IMAPHost, "port", acc.IMAPPort, "use_tls", acc.IMAPUseTLS)
 
 	if acc.IMAPPassword == "" {
 		return nil, errors.New("imap password is required")
 	}
+	if err := netutil.ValidatePublicHost(acc.IMAPHost); err != nil {
+		return nil, fmt.Errorf("imap host not allowed: %w", err)
+	}
+	if err := netutil.RequireTLSUnlessLocalhost(acc.IMAPHost, acc.IMAPUseTLS, "IMAP"); err != nil {
+		return nil, err
+	}
 
 	p := &accountPool{
+		poolKey:   key,
+		ownerID:   acc.OwnerUserID,
 		accountID: acc.ID,
 		imapCfg: imapAccountConfig{
 			Host:     acc.IMAPHost,
@@ -110,7 +143,7 @@ func (m *Manager) getOrCreatePool(acc *types.Account) (*accountPool, error) {
 		idle:     make([]*pooledConn, 0, m.cfg.MaxConnsPerAccount),
 	}
 
-	m.pools[acc.ID] = p
+	m.pools[key] = p
 	logger.Info("imap pool created", "max_conns", p.maxConns, "idle_timeout", p.idleT)
 	return p, nil
 }
@@ -126,19 +159,52 @@ func (m *Manager) Acquire(ctx context.Context, acc *types.Account) (*pooledConn,
 }
 
 // Release returns the connection to the pool or closes it on error.
-func (m *Manager) Release(accID string, conn *pooledConn, hadError bool) {
+func (m *Manager) Release(acc *types.Account, conn *pooledConn, hadError bool) {
+	if conn == nil {
+		return
+	}
+	if acc == nil || acc.OwnerUserID == "" || acc.ID == "" {
+		if conn.client != nil {
+			m.cfg.Logger.Warn("releasing connection without account identity; closing",
+				"had_error", hadError)
+			conn.client.Close()
+		}
+		return
+	}
+	key := PoolKey(acc.OwnerUserID, acc.ID)
 	m.mu.Lock()
-	p, ok := m.pools[accID]
+	p, ok := m.pools[key]
 	m.mu.Unlock()
-	if !ok || conn == nil {
-		if conn != nil && conn.client != nil {
+	if !ok {
+		if conn.client != nil {
 			m.cfg.Logger.Warn("releasing connection with no matching pool; closing",
-				"account_id", accID, "had_error", hadError)
+				"owner_user_id", acc.OwnerUserID, "account_id", acc.ID, "had_error", hadError)
 			conn.client.Close()
 		}
 		return
 	}
 	p.release(conn, hadError)
+}
+
+// DropPool closes and removes the pool for a user's account (e.g. on remove or
+// credential rotation). Safe to call when no pool exists.
+func (m *Manager) DropPool(ownerUserID, accountID string) {
+	if ownerUserID == "" || accountID == "" {
+		return
+	}
+	key := PoolKey(ownerUserID, accountID)
+	m.mu.Lock()
+	p, ok := m.pools[key]
+	if ok {
+		delete(m.pools, key)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	m.cfg.Logger.Info("dropping imap pool",
+		"owner_user_id", ownerUserID, "account_id", accountID)
+	p.closeAll()
 }
 
 // CloseAll closes all pooled connections (for shutdown).
@@ -209,8 +275,17 @@ func (p *accountPool) acquire(ctx context.Context) (*pooledConn, error) {
 }
 
 func (p *accountPool) dialAndLogin(ctx context.Context) (*pooledConn, error) {
+	// Re-check at dial time so a pool cannot be abused if validation rules tighten.
+	if err := netutil.ValidatePublicHost(p.imapCfg.Host); err != nil {
+		return nil, fmt.Errorf("imap host not allowed: %w", err)
+	}
+	if err := netutil.RequireTLSUnlessLocalhost(p.imapCfg.Host, p.imapCfg.UseTLS, "IMAP"); err != nil {
+		return nil, err
+	}
+
 	addr := fmt.Sprintf("%s:%d", p.imapCfg.Host, p.imapCfg.Port)
-	logger := p.logger.With("op", "dial_and_login", "account_id", p.accountID,
+	logger := p.logger.With("op", "dial_and_login",
+		"owner_user_id", p.ownerID, "account_id", p.accountID,
 		"host", p.imapCfg.Host, "port", p.imapCfg.Port, "use_tls", p.imapCfg.UseTLS)
 
 	start := time.Now()
@@ -220,11 +295,10 @@ func (p *accountPool) dialAndLogin(ctx context.Context) (*pooledConn, error) {
 	var err error
 
 	if p.imapCfg.UseTLS {
-		client, err = imapclient.DialTLS(addr, &imapclient.Options{
-			// TLSConfig can be customized if needed
-		})
+		client, err = imapclient.DialTLS(addr, &imapclient.Options{})
 	} else {
-		client, err = imapclient.DialStartTLS(addr, nil)
+		// Non-TLS is only permitted for localhost (checked above).
+		client, err = imapclient.DialInsecure(addr, &imapclient.Options{})
 	}
 	if err != nil {
 		logger.ErrorContext(ctx, "imap dial failed", "error", err, "elapsed", time.Since(start))
@@ -320,7 +394,7 @@ func (m *Manager) ListFolders(ctx context.Context, acc *types.Account) ([]types.
 	released := false
 	defer func() {
 		if !released {
-			m.Release(acc.ID, conn, false)
+			m.Release(acc, conn, false)
 		}
 	}()
 
@@ -331,7 +405,7 @@ func (m *Manager) ListFolders(ctx context.Context, acc *types.Account) ([]types.
 		logger.ErrorContext(ctx, "LIST command failed",
 			"error", err,
 			"elapsed", time.Since(start))
-		m.Release(acc.ID, conn, true)
+		m.Release(acc, conn, true)
 		released = true
 		return nil, fmt.Errorf("list mailboxes: %w", err)
 	}
@@ -372,7 +446,7 @@ func (m *Manager) SearchEmails(ctx context.Context, acc *types.Account, folder s
 	}
 	hadErr := false
 	defer func() {
-		m.Release(acc.ID, conn, hadErr)
+		m.Release(acc, conn, hadErr)
 	}()
 
 	// Select folder (we track to reduce churn but still select each time for safety)
@@ -468,7 +542,7 @@ func (m *Manager) GetEmail(ctx context.Context, acc *types.Account, folder strin
 	}
 	hadErr := false
 	defer func() {
-		m.Release(acc.ID, conn, hadErr)
+		m.Release(acc, conn, hadErr)
 	}()
 
 	_, err = conn.client.Select(folder, nil).Wait()
@@ -566,7 +640,7 @@ func (m *Manager) MoveEmails(ctx context.Context, acc *types.Account, folder str
 		return err
 	}
 	hadErr := false
-	defer func() { m.Release(acc.ID, conn, hadErr) }()
+	defer func() { m.Release(acc, conn, hadErr) }()
 
 	_, err = conn.client.Select(folder, nil).Wait()
 	if err != nil {
@@ -607,7 +681,7 @@ func (m *Manager) FlagEmails(ctx context.Context, acc *types.Account, folder str
 		return err
 	}
 	hadErr := false
-	defer func() { m.Release(acc.ID, conn, hadErr) }()
+	defer func() { m.Release(acc, conn, hadErr) }()
 
 	_, err = conn.client.Select(folder, nil).Wait()
 	if err != nil {

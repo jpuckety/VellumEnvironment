@@ -304,7 +304,7 @@ func (c *Client) GetUserConfig(ctx context.Context, googleToken, userID, account
 	}
 
 	for _, acc := range accs {
-		// Config API stores a single password used for IMAP (and typically SMTP).
+		// Secret document may include both; fall back SMTP → IMAP when unset.
 		if acc.SMTPPassword == "" {
 			acc.SMTPPassword = acc.IMAPPassword
 		}
@@ -344,7 +344,12 @@ func (c *Client) PutUserConfig(ctx context.Context, googleToken, userID string, 
 	}
 	logger.DebugContext(ctx, "putting user config")
 
-	// Password is stored in Secrets Manager by the Config API; remaining fields go to DynamoDB.
+	// Passwords go into a single Secrets Manager document via the Config API;
+	// remaining fields are stored in DynamoDB (never echo secrets in list APIs).
+	smtpPass := acc.SMTPPassword
+	if smtpPass == "" {
+		smtpPass = acc.IMAPPassword
+	}
 	payload := map[string]any{
 		"id":            acc.ID,
 		"name":          acc.Name,
@@ -358,9 +363,7 @@ func (c *Client) PutUserConfig(ctx context.Context, googleToken, userID string, 
 		"smtp_use_tls":  acc.SMTPUseTLS,
 		"from_address":  acc.FromAddress,
 		"password":      acc.IMAPPassword,
-	}
-	if acc.SMTPPassword != "" && acc.SMTPPassword != acc.IMAPPassword {
-		payload["smtp_password"] = acc.SMTPPassword
+		"smtp_password": smtpPass,
 	}
 
 	body, err := json.Marshal(payload)

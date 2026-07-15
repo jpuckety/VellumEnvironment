@@ -12,6 +12,7 @@ import (
 
 	emailpkg "github.com/jordan-wright/email"
 
+	"github.com/jpuckett/EmailMCP/emailmcp/internal/netutil"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
 
@@ -41,6 +42,12 @@ func NewSender(cfg Config) *Sender {
 func (s *Sender) SendEmail(ctx context.Context, acc *types.Account, input types.SendEmailInput) error {
 	if acc == nil {
 		return errors.New("account is required")
+	}
+	if err := netutil.ValidatePublicHost(acc.SMTPHost); err != nil {
+		return fmt.Errorf("smtp host not allowed: %w", err)
+	}
+	if err := netutil.RequireTLSUnlessLocalhost(acc.SMTPHost, acc.SMTPUseTLS, "SMTP"); err != nil {
+		return err
 	}
 
 	smtpPass := acc.SMTPPassword
@@ -117,6 +124,7 @@ func (s *Sender) SendEmail(ctx context.Context, acc *types.Account, input types.
 				sendErr = e.SendWithStartTLS(addr, auth, tlsConfig)
 			}
 		} else {
+			// Non-TLS is only permitted for localhost (checked above).
 			sendErr = e.Send(addr, auth)
 		}
 		done <- sendErr

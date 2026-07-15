@@ -12,10 +12,14 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 ## Security Rules (Non-Negotiable)
 - Never log passwords, decrypted credentials, or sensitive email content.
 - Credentials are never persisted by the EmailMCP process; they are loaded from the Config API for the lifetime of a request/connection.
+- IMAP and SMTP passwords live in one Secrets Manager document; list APIs must never echo secrets.
 - HTTP request/response logging redacts `Authorization`, `Cookie`, and `Proxy-Authorization`.
+- IMAP pools are keyed by `(OwnerUserID, accountID)` — always set `Account.OwnerUserID` from the authenticated subject; call `DropPool` on remove/credential change.
+- Reject private/link-local/metadata IMAP/SMTP hosts (`internal/netutil`); require TLS except for explicit localhost (loopback is still blocked by host validation).
 
 ## Architecture Overview
 - `internal/config` — Env config + Config API client (SigV4 + Google bearer token)
+- `internal/netutil` — Outbound host validation (SSRF) and TLS policy helpers
 - `internal/imap` — IMAP connection pool and operations
 - `internal/smtp` — SMTP client management and sending logic
 - `internal/server` — MCP server setup, Google auth middleware, tool registration
@@ -68,8 +72,10 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 
 ## Common Pitfalls to Avoid
 - Logging plaintext passwords or serializing them into MCP responses.
+- Keying IMAP pools by account ID alone (cross-tenant pool collision).
 - Creating long-lived IMAP connections outside the pool manager.
 - Assuming folder selection state persists across pool acquires.
 - Forgetting to close or properly release connections on error paths.
 - Using sequence numbers instead of UIDs for operations across sessions.
 - Falling back to any local database or file for account storage.
+- Storing `smtp_password` in DynamoDB or accepting client-supplied `secretArn`.
