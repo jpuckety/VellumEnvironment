@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-
-	"github.com/coreos/go-oidc/v3/oidc"
 )
 
 type contextKey string
@@ -22,26 +20,14 @@ type UserInfo struct {
 }
 
 type Authenticator struct {
-	verifier            *oidc.IDTokenVerifier
+	tokens              *TokenIssuer
 	publicBaseURL       string
 	resourceMetadataURL string
 }
 
-func NewAuthenticator(ctx context.Context, clientID, publicBaseURL string) (*Authenticator, error) {
-	provider, err := oidc.NewProvider(ctx, "https://accounts.google.com")
-	if err != nil {
-		return nil, err
-	}
-
-	config := &oidc.Config{
-		ClientID: clientID,
-	}
-	// If ClientID is empty, it will only verify the signature and issuer.
-	if clientID == "" {
-		config.SkipClientIDCheck = true
-	}
-	verifier := provider.Verifier(config)
-
+// NewAuthenticator builds the resource-server middleware that verifies the
+// server's own session JWTs (issued after Google sign-in) using tokens.
+func NewAuthenticator(tokens *TokenIssuer, publicBaseURL string) *Authenticator {
 	base := strings.TrimRight(publicBaseURL, "/")
 	resourceMeta := ""
 	if base != "" {
@@ -49,10 +35,10 @@ func NewAuthenticator(ctx context.Context, clientID, publicBaseURL string) (*Aut
 	}
 
 	return &Authenticator{
-		verifier:            verifier,
+		tokens:              tokens,
 		publicBaseURL:       base,
 		resourceMetadataURL: resourceMeta,
-	}, nil
+	}
 }
 
 func (a *Authenticator) writeUnauthorized(w http.ResponseWriter, r *http.Request, msg string) {
@@ -121,27 +107,26 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		}
 
 		token := parts[1]
-		idToken, err := a.verifier.Verify(r.Context(), token)
+		claims, err := a.tokens.Verify(token)
 		if err != nil {
 			a.writeUnauthorized(w, r, "Unauthorized: Invalid token: "+err.Error())
 			return
 		}
 
-		var claims struct {
-			Email string `json:"email"`
-		}
-		if err := idToken.Claims(&claims); err != nil {
-			a.writeUnauthorized(w, r, "Unauthorized: Failed to parse claims")
-			return
-		}
-
 		userInfo := &UserInfo{
-			Subject: idToken.Subject,
+			Subject: claims.Subject,
 			Email:   claims.Email,
 		}
 
 		ctx := context.WithValue(r.Context(), userContextKey, userInfo)
-		ctx = context.WithValue(ctx, tokenContextKey, token)
+		// Forward the embedded Google ID token downstream: the Config API expects a
+		// genuine Google token, not our session JWT. Fall back to the raw bearer
+		// token if none was embedded.
+		downstreamToken := claims.GoogleIDToken
+		if downstreamToken == "" {
+			downstreamToken = token
+		}
+		ctx = context.WithValue(ctx, tokenContextKey, downstreamToken)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

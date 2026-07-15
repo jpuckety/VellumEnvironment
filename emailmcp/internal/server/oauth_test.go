@@ -14,7 +14,11 @@ import (
 
 func testOAuthServer(t *testing.T) *OAuthServer {
 	t.Helper()
-	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", nil)
+	tokens, err := NewTokenIssuer([]byte("test-signing-secret"), "https://emailmcp.ecg.co", accessTokenTTL)
+	if err != nil {
+		t.Fatalf("NewTokenIssuer: %v", err)
+	}
+	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", tokens, nil)
 	if err != nil {
 		t.Fatalf("NewOAuthServer: %v", err)
 	}

@@ -6,8 +6,8 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.42.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.30
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.71.1
-	github.com/coreos/go-oidc/v3 v3.20.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/jordan-wright/email v4.0.1-0.20210109023952-943e75fe5223+incompatible
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	golang.org/x/oauth2 v0.36.0
@@ -29,7 +29,6 @@ require (
 	github.com/aws/smithy-go v1.27.3 // indirect
 	github.com/emersion/go-message v0.18.2 // indirect
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect

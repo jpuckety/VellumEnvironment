@@ -21,16 +21,18 @@ import (
 const (
 	oauthCodeTTL    = 5 * time.Minute
 	oauthPendingTTL = 15 * time.Minute
-	oauthRefreshTTL = 30 * 24 * time.Hour
 	oauthClientTTL  = 90 * 24 * time.Hour
 )
 
 // OAuthServer is a thin OAuth 2.1 authorization server that fronts Google
-// sign-in for MCP clients. It issues the Google ID token as the access_token
-// so existing EmailMCP / Config API verification continues to work.
+// sign-in for MCP clients. After Google verifies the user it issues the
+// server's own short-lived JWT as the access_token (paired with a longer-lived
+// refresh token). The Google ID token is embedded in the JWT so downstream
+// EmailMCP / Config API verification continues to work.
 type OAuthServer struct {
 	baseURL      string
 	googleConfig *oauth2.Config
+	tokens       *TokenIssuer
 	logger       *slog.Logger
 	httpClient   *http.Client
 
@@ -66,6 +68,8 @@ type issuedCode struct {
 
 type refreshEntry struct {
 	ClientID      string
+	Subject       string
+	Email         string
 	GoogleRefresh string
 	ExpiresAt     time.Time
 }
@@ -78,14 +82,18 @@ type oauthClient struct {
 	ExpiresAt    time.Time
 }
 
-// NewOAuthServer builds the Google-backed OAuth authorization server.
-func NewOAuthServer(baseURL, clientID, clientSecret string, logger *slog.Logger) (*OAuthServer, error) {
+// NewOAuthServer builds the Google-backed OAuth authorization server. tokens is
+// used to mint the short-lived session JWTs returned as access_tokens.
+func NewOAuthServer(baseURL, clientID, clientSecret string, tokens *TokenIssuer, logger *slog.Logger) (*OAuthServer, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("PUBLIC_BASE_URL is required for OAuth")
 	}
 	if clientID == "" || clientSecret == "" {
 		return nil, fmt.Errorf("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required for OAuth")
+	}
+	if tokens == nil {
+		return nil, fmt.Errorf("token issuer is required for OAuth")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -100,6 +108,7 @@ func NewOAuthServer(baseURL, clientID, clientSecret string, logger *slog.Logger)
 			Scopes:       []string{"openid", "email", "profile"},
 			Endpoint:     google.Endpoint,
 		},
+		tokens:     tokens,
 		logger:     logger,
 		httpClient: http.DefaultClient,
 		pending:    make(map[string]*pendingAuth),
@@ -423,31 +432,36 @@ func (o *OAuthServer) tokenAuthorizationCode(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	expiresIn := int(time.Until(issued.Expiry).Seconds())
-	if expiresIn < 60 {
-		expiresIn = 3600
+	// Issue our own short-lived session JWT (1h) instead of forwarding the
+	// Google ID token directly. The Google ID token is embedded in the JWT so
+	// downstream Config API calls can still present a genuine Google token.
+	subject, email := googleIDClaims(issued.IDToken)
+	accessToken, expiry, err := o.tokens.Issue(subject, email, issued.IDToken)
+	if err != nil {
+		o.logger.Error("failed to issue session jwt", "error", err)
+		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue access token")
+		return
 	}
 
 	resp := map[string]any{
-		"access_token": issued.IDToken,
+		"access_token": accessToken,
 		"token_type":   "Bearer",
-		"expires_in":   expiresIn,
+		"expires_in":   int(time.Until(expiry).Seconds()),
 		"scope":        "openid email profile",
-		"id_token":     issued.IDToken,
 	}
 
-	if issued.GoogleRefresh != "" {
-		ourRefresh, err := randomToken(32)
-		if err == nil {
-			o.mu.Lock()
-			o.refresh[ourRefresh] = &refreshEntry{
-				ClientID:      issued.ClientID,
-				GoogleRefresh: issued.GoogleRefresh,
-				ExpiresAt:     time.Now().Add(oauthRefreshTTL),
-			}
-			o.mu.Unlock()
-			resp["refresh_token"] = ourRefresh
+	// Pair the JWT with a refresh token (7 days) for longer-lived access.
+	if ourRefresh, err := randomToken(32); err == nil {
+		o.mu.Lock()
+		o.refresh[ourRefresh] = &refreshEntry{
+			ClientID:      issued.ClientID,
+			Subject:       subject,
+			Email:         email,
+			GoogleRefresh: issued.GoogleRefresh,
+			ExpiresAt:     time.Now().Add(refreshTokenTTL),
 		}
+		o.mu.Unlock()
+		resp["refresh_token"] = ourRefresh
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -494,17 +508,27 @@ func (o *OAuthServer) tokenRefresh(w http.ResponseWriter, r *http.Request) {
 		o.mu.Unlock()
 	}
 
-	expiresIn := int(time.Until(newTok.Expiry).Seconds())
-	if expiresIn < 60 {
-		expiresIn = 3600
+	// Mint a fresh session JWT embedding the new Google ID token. Fall back to
+	// the identity stored on the refresh entry if the new token omits claims.
+	subject, email := googleIDClaims(idToken)
+	if subject == "" {
+		subject = entry.Subject
+	}
+	if email == "" {
+		email = entry.Email
+	}
+	accessToken, expiry, err := o.tokens.Issue(subject, email, idToken)
+	if err != nil {
+		o.logger.Error("failed to issue session jwt on refresh", "error", err)
+		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue access token")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  idToken,
+		"access_token":  accessToken,
 		"token_type":    "Bearer",
-		"expires_in":    expiresIn,
+		"expires_in":    int(time.Until(expiry).Seconds()),
 		"scope":         "openid email profile",
-		"id_token":      idToken,
 		"refresh_token": refreshToken,
 	})
 }

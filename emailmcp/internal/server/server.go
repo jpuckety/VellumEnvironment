@@ -58,6 +58,17 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	logger := slog.Default()
 
+	// The token issuer signs and verifies the server's own session JWTs. It is
+	// shared by the OAuth server (which mints them) and the authenticator (which
+	// verifies them), so both must use the same signing key.
+	tokens, err := NewTokenIssuer([]byte(cfg.JWTSecret), cfg.PublicBaseURL, accessTokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create token issuer: %w", err)
+	}
+	if cfg.JWTSecret == "" {
+		logger.Warn("EMAILMCP_JWT_SECRET not set; using a random signing key (issued sessions will not survive a restart or span multiple instances)")
+	}
+
 	// OAuth (HTTP mode) needs a public base URL and Google client secret so MCP
 	// clients can complete the authorization code + PKCE flow via Google.
 	var oauth *OAuthServer
@@ -68,17 +79,13 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		if cfg.GoogleClientSecret == "" {
 			return nil, errors.New("GOOGLE_CLIENT_SECRET is required for HTTP mode OAuth")
 		}
-		var err error
-		oauth, err = NewOAuthServer(cfg.PublicBaseURL, cfg.GoogleClientID, cfg.GoogleClientSecret, logger)
+		oauth, err = NewOAuthServer(cfg.PublicBaseURL, cfg.GoogleClientID, cfg.GoogleClientSecret, tokens, logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create oauth server: %w", err)
 		}
 	}
 
-	auth, err := NewAuthenticator(ctx, cfg.GoogleClientID, cfg.PublicBaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create authenticator: %w", err)
-	}
+	auth := NewAuthenticator(tokens, cfg.PublicBaseURL)
 
 	configClient := config.NewClient(cfg.ConfigAPIURL, cfg.ApplicationID)
 
@@ -588,7 +595,7 @@ func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in Sen
 func (s *Server) requireAuth(ctx context.Context) (*UserInfo, string, error) {
 	userInfo, ok := UserFromContext(ctx)
 	if !ok {
-		return nil, "", errors.New("authentication required: provide a valid Google ID token")
+		return nil, "", errors.New("authentication required: provide a valid session token")
 	}
 	token, ok := TokenFromContext(ctx)
 	if !ok || token == "" {

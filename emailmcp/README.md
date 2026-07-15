@@ -155,6 +155,7 @@ See `.env.example`. Key variables for the MCP server:
 | `GOOGLE_CLIENT_ID` | Yes | Google OAuth2 Client ID for ID token verification. |
 | `GOOGLE_CLIENT_SECRET` | Yes (HTTP) | Google client secret for the MCP OAuth authorize/token proxy. |
 | `PUBLIC_BASE_URL` | Yes (HTTP) | Public origin (issuer + OAuth redirect base), e.g. `https://emailmcp.ecg.co`. |
+| `EMAILMCP_JWT_SECRET` | No (HTTP) | Signing key for the session JWTs issued after Google sign-in (1h access token + 7d refresh token). Set a strong, stable value in production; a random key is generated when unset. |
 | `APPLICATION_ID` | No | Application partition key (default: `default`). |
 | `EMAILMCP_LOG_LEVEL` | No | `debug`, `info` (default), `warn`, `error`. |
 | `EMAILMCP_TRANSPORT` | No | `http` (default) or `stdio`. |
@@ -339,3 +340,42 @@ go build ./...
 - Account secrets live only in Secrets Manager; EmailMCP does not persist them.
 - Use TLS for IMAP/SMTP in production.
 - Consider running behind a reverse proxy if exposing publicly; MCP routes already require Google ID tokens.
+
+## AWS Resource Cost Estimate
+
+Based on the infrastructure provided in this project, here is an estimate of the AWS resource costs for a single user performing 4 email check-and-summarize cycles per hour (approx. 2,880 checks/month).
+
+### 1. Fixed Infrastructure Costs (Monthly)
+These costs are incurred once the infrastructure is deployed, regardless of usage volume.
+
+| Resource | Description | Monthly Cost (Est.) |
+| :--- | :--- | :--- |
+| **Amazon EKS** | Control Plane ($0.10/hour) | $73.00 |
+| **Application Load Balancer** | ALB Ingress ($0.0225/hour + LCU) | $16.50 |
+| **AWS KMS** | 1 Customer Managed Key (CMK) | $1.00 |
+| **Secrets Manager** | 1 Secret (IMAP Credentials) | $0.40 |
+| **Total Fixed Costs** | | **$90.90** |
+
+### 2. Variable Usage Costs (Monthly)
+These costs scale with the number of checks and summaries performed.
+
+| Resource | Activity Detail | Monthly Cost (Est.) |
+| :--- | :--- | :--- |
+| **AWS Bedrock (LLM)** | Claude 3.5 Sonnet (2,880 summaries) | $25.92 |
+| **AWS Fargate** | 0.5 vCPU / 1GB RAM for Go MCP Server | $18.02 |
+| **AWS Lambda** | 2,880 Config API calls (256MB, <500ms) | < $0.05 |
+| **Amazon DynamoDB** | ~5,760 Read/Write Units (On-demand) | < $0.01 |
+| **Secrets Manager API** | ~2,880 API calls | $0.02 |
+| **Total Variable Costs** | | **$44.01** |
+
+### 3. Total Cost Estimate
+
+*   **Dedicated Environment (Single User)**: ~$134.91 / month
+*   **Shared Environment (Incremental Cost)**: ~$44.01 / month
+
+### 4. Cost Optimization Opportunities
+*   **Lower-cost Model**: Switching to **Claude 3 Haiku** for summarization reduces Bedrock costs to ~$2.16/month.
+*   **Lambda-based Hosting**: Adapting the Go MCP server to run on AWS Lambda or App Runner could eliminate the fixed EKS/ALB costs.
+*   **Local Execution**: Running the MCP server locally and only calling the AWS Config API and Bedrock costs ~$27.32/month.
+
+*Note: Prices are based on `us-east-1` region. Bedrock costs assume 2,000 input tokens and 200 output tokens per summary.*

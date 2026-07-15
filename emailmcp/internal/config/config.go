@@ -41,6 +41,10 @@ type Config struct {
 	// PublicBaseURL is the externally reachable origin of this server
 	// (e.g. https://emailmcp.ecg.co). Used for OAuth metadata and redirect URIs.
 	PublicBaseURL string
+	// JWTSecret signs the short-lived session JWTs issued to MCP clients after
+	// Google sign-in. When empty, a random key is generated at startup (sessions
+	// will not survive a restart or span multiple instances).
+	JWTSecret string
 }
 
 // Load reads configuration from environment with sensible defaults.
@@ -57,6 +61,7 @@ func Load() (*Config, error) {
 		GoogleClientID:         getEnv("GOOGLE_CLIENT_ID", ""),
 		GoogleClientSecret:     getEnv("GOOGLE_CLIENT_SECRET", ""),
 		PublicBaseURL:          strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/"),
+		JWTSecret:              getEnv("EMAILMCP_JWT_SECRET", ""),
 	}
 
 	if cfg.IMAPMaxConnsPerAccount < 1 {
@@ -80,6 +85,7 @@ func Load() (*Config, error) {
 		"google_client_id_set", cfg.GoogleClientID != "",
 		"google_client_secret_set", cfg.GoogleClientSecret != "",
 		"public_base_url", cfg.PublicBaseURL,
+		"jwt_secret_set", cfg.JWTSecret != "",
 		"aws_region", os.Getenv("AWS_REGION"),
 	)
 
