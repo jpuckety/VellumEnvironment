@@ -249,7 +249,7 @@ func (s *Server) registerTools() {
 	// Account management (Config API)
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "add_email_account",
-		Description: "Create or replace the authenticated user's email account (IMAP + SMTP). Credentials are stored via the Config API (DynamoDB + Secrets Manager).",
+		Description: "Create or replace the authenticated user's email account (IMAP + SMTP). Credentials are stored via the Config API.",
 	}, s.addEmailAccount)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
