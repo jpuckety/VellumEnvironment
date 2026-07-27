@@ -31,9 +31,8 @@ type Config struct {
 	// Transport
 	Transport string // "http" or "stdio"
 
-	// Auth & remote account storage (Config API)
+	// Auth & remote account storage
 	ApplicationID  string
-	ConfigAPIURL   string
 	GoogleClientID string
 	// GoogleClientSecret is required for HTTP mode OAuth (authorization code
 	// exchange with Google). Not used for ID-token verification itself.
@@ -41,10 +40,18 @@ type Config struct {
 	// PublicBaseURL is the externally reachable origin of this server
 	// (e.g. https://emailmcp.ecg.co). Used for OAuth metadata and redirect URIs.
 	PublicBaseURL string
-	// JWTSecret signs the short-lived session JWTs issued to MCP clients after
-	// Google sign-in. When empty, a random key is generated at startup (sessions
-	// will not survive a restart or span multiple instances).
-	JWTSecret string
+	// SessionTableName is the DynamoDB table used to persist OAuth sessions
+	// (opaque access/refresh tokens) and registered clients. When empty, an
+	// in-memory store is used (sessions will not survive a restart or span
+	// replicas). Resolved from EMAILMCP_SESSION_TABLE or the SSM parameter
+	// /emailmcp/session-table/name.
+	SessionTableName string
+	// UserConfigTableName is the DynamoDB table used to persist per-user email
+	// account configurations (previously fronted by the Config API Lambda). When
+	// empty, an in-memory store is used (accounts will not survive a restart or
+	// span replicas). Resolved from EMAILMCP_USER_CONFIG_TABLE or the SSM
+	// parameter /emailmcp/user-config-table/name.
+	UserConfigTableName string
 	// OAuthRedirectAllowlist restricts HTTPS OAuth redirect_uris when non-empty.
 	// Entries are comma-separated hostnames (example.com, *.example.com) or
 	// https origins/URIs. Empty means the allowlist is not enforced (any HTTPS
@@ -63,11 +70,11 @@ func Load() (*Config, error) {
 		LogLevel:               getEnv("EMAILMCP_LOG_LEVEL", "info"),
 		Transport:              getEnv("EMAILMCP_TRANSPORT", "http"),
 		ApplicationID:          getEnv("APPLICATION_ID", "default"),
-		ConfigAPIURL:           getEnv("CONFIG_API_URL", ""),
 		GoogleClientID:         getEnv("GOOGLE_CLIENT_ID", ""),
 		GoogleClientSecret:     getEnv("GOOGLE_CLIENT_SECRET", ""),
 		PublicBaseURL:          strings.TrimRight(getEnv("PUBLIC_BASE_URL", ""), "/"),
-		JWTSecret:              getEnv("EMAILMCP_JWT_SECRET", ""),
+		SessionTableName:       getEnv("EMAILMCP_SESSION_TABLE", ""),
+		UserConfigTableName:    getEnv("EMAILMCP_USER_CONFIG_TABLE", ""),
 		OAuthRedirectAllowlist: parseCSVEnv("OAUTH_REDIRECT_ALLOWLIST"),
 	}
 
@@ -87,12 +94,13 @@ func Load() (*Config, error) {
 		"log_level", cfg.LogLevel,
 		"transport", cfg.Transport,
 		"application_id", cfg.ApplicationID,
-		"config_api_url_set", cfg.ConfigAPIURL != "",
-		"config_api_url", cfg.ConfigAPIURL,
 		"google_client_id_set", cfg.GoogleClientID != "",
 		"google_client_secret_set", cfg.GoogleClientSecret != "",
 		"public_base_url", cfg.PublicBaseURL,
-		"jwt_secret_set", cfg.JWTSecret != "",
+		"session_table_set", cfg.SessionTableName != "",
+		"session_table", cfg.SessionTableName,
+		"user_config_table_set", cfg.UserConfigTableName != "",
+		"user_config_table", cfg.UserConfigTableName,
 		"oauth_redirect_allowlist_enforced", len(cfg.OAuthRedirectAllowlist) > 0,
 		"oauth_redirect_allowlist_entries", len(cfg.OAuthRedirectAllowlist),
 		"aws_region", os.Getenv("AWS_REGION"),
@@ -105,63 +113,66 @@ func Load() (*Config, error) {
 func (c *Config) FetchRemoteDefaults(ctx context.Context) {
 	logger := slog.Default().With("op", "fetch_remote_defaults")
 
-	if c.ConfigAPIURL != "" {
-		logger.DebugContext(ctx, "skipping SSM lookup; CONFIG_API_URL already set",
-			"config_api_url", c.ConfigAPIURL,
-		)
+	needSessionTable := c.SessionTableName == ""
+	needUserConfigTable := c.UserConfigTableName == ""
+	if !needSessionTable && !needUserConfigTable {
+		logger.DebugContext(ctx, "skipping SSM lookup; session and user config tables already set")
 		return
 	}
 
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
-		logger.DebugContext(ctx, "skipping SSM lookup; AWS_REGION unset and CONFIG_API_URL empty")
+		logger.DebugContext(ctx, "skipping SSM lookup; AWS_REGION unset")
 		return
 	}
 
-	const paramName = "/emailmcp/config-api/url"
-	logger.InfoContext(ctx, "resolving CONFIG_API_URL from SSM",
-		"parameter", paramName,
-		"region", region,
-	)
-
-	start := time.Now()
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		logger.WarnContext(ctx, "failed to load AWS config for SSM lookup",
 			"region", region,
 			"error", err,
-			"elapsed", time.Since(start),
 		)
 		return
 	}
-
 	client := ssm.NewFromConfig(cfg)
+
+	if needSessionTable {
+		if v := getSSMParameter(ctx, client, "/emailmcp/session-table/name", logger); v != "" {
+			c.SessionTableName = v
+			logger.InfoContext(ctx, "session table resolved from SSM", "session_table", v)
+		}
+	}
+	if needUserConfigTable {
+		if v := getSSMParameter(ctx, client, "/emailmcp/user-config-table/name", logger); v != "" {
+			c.UserConfigTableName = v
+			logger.InfoContext(ctx, "user config table resolved from SSM", "user_config_table", v)
+		}
+	}
+}
+
+// getSSMParameter reads a single SSM parameter, returning "" on any error or
+// when the parameter is missing.
+func getSSMParameter(ctx context.Context, client *ssm.Client, name string, logger *slog.Logger) string {
+	start := time.Now()
 	out, err := client.GetParameter(ctx, &ssm.GetParameterInput{
-		Name: aws.String(paramName),
+		Name: aws.String(name),
 	})
 	if err != nil {
 		logger.WarnContext(ctx, "SSM GetParameter failed",
-			"parameter", paramName,
-			"region", region,
+			"parameter", name,
 			"error", err,
 			"elapsed", time.Since(start),
 		)
-		return
+		return ""
 	}
-	if out.Parameter == nil || out.Parameter.Value == nil || *out.Parameter.Value == "" {
+	if out.Parameter == nil || out.Parameter.Value == nil {
 		logger.WarnContext(ctx, "SSM parameter missing or empty",
-			"parameter", paramName,
+			"parameter", name,
 			"elapsed", time.Since(start),
 		)
-		return
+		return ""
 	}
-
-	c.ConfigAPIURL = *out.Parameter.Value
-	logger.InfoContext(ctx, "CONFIG_API_URL resolved from SSM",
-		"parameter", paramName,
-		"config_api_url", c.ConfigAPIURL,
-		"elapsed", time.Since(start),
-	)
+	return *out.Parameter.Value
 }
 
 func getEnv(key, def string) string {

@@ -28,14 +28,11 @@ type Server struct {
 	cfg           *config.Config
 	authenticator *Authenticator
 	oauth         *OAuthServer
-	configClient  *config.Client
+	configStore   config.Store
 }
 
 // New creates and configures the EmailMCP server.
 func New(ctx context.Context, cfg *config.Config) (*Server, error) {
-	if cfg.ConfigAPIURL == "" {
-		return nil, errors.New("CONFIG_API_URL is required")
-	}
 	if cfg.GoogleClientID == "" {
 		return nil, errors.New("GOOGLE_CLIENT_ID is required")
 	}
@@ -59,15 +56,14 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 
 	logger := slog.Default()
 
-	// The token issuer signs and verifies the server's own session JWTs. It is
-	// shared by the OAuth server (which mints them) and the authenticator (which
-	// verifies them), so both must use the same signing key.
-	tokens, err := NewTokenIssuer([]byte(cfg.JWTSecret), cfg.PublicBaseURL, accessTokenTTL)
+	// The session store persists issued OAuth sessions (opaque access/refresh
+	// tokens) and registered clients so they survive restarts and span replicas.
+	// It is shared by the OAuth server (which writes sessions) and the
+	// authenticator (which resolves them). Falls back to an in-memory store when
+	// no DynamoDB session table is configured.
+	store, err := NewSessionStore(ctx, cfg.SessionTableName, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create token issuer: %w", err)
-	}
-	if cfg.JWTSecret == "" {
-		logger.Warn("EMAILMCP_JWT_SECRET not set; using a random signing key (issued sessions will not survive a restart or span multiple instances)")
+		return nil, fmt.Errorf("failed to create session store: %w", err)
 	}
 
 	// OAuth (HTTP mode) needs a public base URL and Google client secret so MCP
@@ -80,7 +76,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		if cfg.GoogleClientSecret == "" {
 			return nil, errors.New("GOOGLE_CLIENT_SECRET is required for HTTP mode OAuth")
 		}
-		oauth, err = NewOAuthServer(cfg.PublicBaseURL, cfg.GoogleClientID, cfg.GoogleClientSecret, tokens, logger, cfg.OAuthRedirectAllowlist)
+		oauth, err = NewOAuthServer(cfg.PublicBaseURL, cfg.GoogleClientID, cfg.GoogleClientSecret, store, logger, cfg.OAuthRedirectAllowlist)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create oauth server: %w", err)
 		}
@@ -93,9 +89,15 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		}
 	}
 
-	auth := NewAuthenticator(tokens, cfg.PublicBaseURL)
+	auth := NewAuthenticator(store, cfg.PublicBaseURL)
 
-	configClient := config.NewClient(cfg.ConfigAPIURL, cfg.ApplicationID)
+	// User email account configurations are read/written directly against the
+	// EmailMCPUserConfigs DynamoDB table (the Config API Lambda has been
+	// removed). Falls back to an in-memory store when no table is configured.
+	configStore, err := config.NewStore(ctx, cfg.UserConfigTableName, cfg.ApplicationID, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user config store: %w", err)
+	}
 
 	es := &Server{
 		mcpServer:     srv,
@@ -105,7 +107,7 @@ func New(ctx context.Context, cfg *config.Config) (*Server, error) {
 		cfg:           cfg,
 		authenticator: auth,
 		oauth:         oauth,
-		configClient:  configClient,
+		configStore:   configStore,
 	}
 
 	es.logger.Info("initializing EmailMCP server", "name", "emailmcp", "version", "0.1.0")
@@ -141,6 +143,19 @@ func (s *Server) HTTPHandler() http.Handler {
 		return s.mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Logger: s.logger,
+		// DNS-rebinding / "localhost" protection is auto-enabled by the SDK and
+		// rejects any request whose connection has a loopback *local* address but
+		// a non-loopback Host header with "403 Forbidden: invalid Host header".
+		// That protection is meant for locally-bound developer servers reachable
+		// from a browser; it is wrong for this deployment, which is intentionally
+		// published at a public hostname (PUBLIC_BASE_URL, e.g.
+		// https://emailmcp.ecg.co) behind an AWS ALB that terminates TLS and
+		// forwards to the pod. When the proxy hop reaches the app over the
+		// loopback interface, every authenticated MCP request (initialize,
+		// tools/call, ...) would otherwise get a spurious 403 *after* a
+		// successful OAuth sign-in. Disable it and rely on the OAuth bearer +
+		// SSRF host validation instead.
+		DisableLocalhostProtection: true,
 	})
 
 	// MCP handler requires Google ID token authentication.
@@ -201,7 +216,17 @@ func httpLogging(logger *slog.Logger, next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
-		logger.Log(r.Context(), level, "http response",
+		// Errors (4xx/5xx) are logged at Warn with the response body and
+		// connection details. Transport-level rejections (e.g. the SDK's
+		// "403 Forbidden: invalid Host header" or a 401 from auth) write their
+		// reason to the body, which is otherwise never surfaced in the logs.
+		// The body is a short plain-text error here (not an MCP payload), so it
+		// is safe to log; successful bodies are never captured.
+		respLevel := level
+		if rec.status >= http.StatusBadRequest {
+			respLevel = slog.LevelWarn
+		}
+		logger.Log(r.Context(), respLevel, "http response",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
@@ -209,15 +234,60 @@ func httpLogging(logger *slog.Logger, next http.Handler) http.Handler {
 			"duration_ms", time.Since(start).Milliseconds(),
 			"resp_content_type", rec.Header().Get("Content-Type"),
 			"resp_mcp_session_id", rec.Header().Get("Mcp-Session-Id"),
+			"host", r.Host,
+			"local_addr", localAddr(r),
+			"error_body", rec.errBody(),
 		)
 	})
 }
+
+// localAddr returns the local (server-side) address of the connection that
+// served r, used to diagnose transport-level rejections such as the SDK's
+// DNS-rebinding / loopback Host check. Returns "" when unavailable.
+func localAddr(r *http.Request) string {
+	if a, ok := r.Context().Value(http.LocalAddrContextKey).(interface{ String() string }); ok && a != nil {
+		return a.String()
+	}
+	return ""
+}
+
+// maxErrBodyCapture bounds how many response-body bytes are retained for
+// logging on error responses.
+const maxErrBodyCapture = 1024
 
 type statusRecorder struct {
 	http.ResponseWriter
 	status  int
 	written int64
 	wrote   bool
+	// errBuf captures the (short, plain-text) response body for error statuses
+	// so the failure reason can be logged; it is left empty for success.
+	errBuf []byte
+}
+
+// errBody returns the captured error-response body (empty for success).
+func (r *statusRecorder) errBody() string {
+	return string(r.errBuf)
+}
+
+// captureErrBody reports whether the response body for the given status is safe
+// and useful to log. It targets transport/auth rejections whose bodies are
+// fixed, request-independent reasons (e.g. "Unauthorized: Invalid token",
+// "Forbidden: invalid Host header ..."). 400 Bad Request is intentionally
+// excluded because the SDK's "malformed payload: %v" body can echo a fragment
+// of the request payload, which may contain account credentials (see the
+// project's Security Rules); MCP tool errors are returned as JSON-RPC results
+// with HTTP 200 and are never captured here.
+func captureErrBody(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, // 401
+		http.StatusForbidden,            // 403
+		http.StatusNotFound,             // 404
+		http.StatusMethodNotAllowed,     // 405
+		http.StatusUnsupportedMediaType: // 415
+		return true
+	}
+	return status >= http.StatusInternalServerError // 5xx
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
@@ -231,6 +301,14 @@ func (r *statusRecorder) WriteHeader(code int) {
 func (r *statusRecorder) Write(b []byte) (int, error) {
 	if !r.wrote {
 		r.wrote = true
+	}
+	// Retain a bounded prefix of error-response bodies for diagnostics.
+	if captureErrBody(r.status) && len(r.errBuf) < maxErrBodyCapture {
+		remaining := maxErrBodyCapture - len(r.errBuf)
+		if remaining > len(b) {
+			remaining = len(b)
+		}
+		r.errBuf = append(r.errBuf, b[:remaining]...)
 	}
 	n, err := r.ResponseWriter.Write(b)
 	r.written += int64(n)
@@ -388,7 +466,7 @@ type SendEmailToolInput struct {
 // --- Handlers ---
 
 func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, in AddAccountInput) (*mcp.CallToolResult, any, error) {
-	user, token, err := s.requireAuth(ctx)
+	user, err := s.requireAuth(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -450,8 +528,8 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		FromAddress:  in.FromAddress,
 	}
 
-	if err := s.configClient.PutUserConfig(ctx, token, user.Subject, acc); err != nil {
-		return nil, nil, fmt.Errorf("store account via config api: %w", err)
+	if err := s.configStore.PutUserConfig(ctx, user.Subject, acc); err != nil {
+		return nil, nil, fmt.Errorf("store account: %w", err)
 	}
 
 	// Drop any existing pool so credential/host changes take effect immediately.
@@ -467,12 +545,12 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 }
 
 func (s *Server) listEmailAccounts(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
-	user, token, err := s.requireAuth(ctx)
+	user, err := s.requireAuth(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	accs, err := s.configClient.ListUserConfigs(ctx, token, user.Subject)
+	accs, err := s.configStore.ListUserConfigs(ctx, user.Subject)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -495,7 +573,7 @@ func (s *Server) listEmailAccounts(ctx context.Context, req *mcp.CallToolRequest
 }
 
 func (s *Server) removeEmailAccount(ctx context.Context, req *mcp.CallToolRequest, in AccountIDInput) (*mcp.CallToolResult, any, error) {
-	user, token, err := s.requireAuth(ctx)
+	user, err := s.requireAuth(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -503,7 +581,7 @@ func (s *Server) removeEmailAccount(ctx context.Context, req *mcp.CallToolReques
 		return nil, nil, errors.New("account_id is required")
 	}
 
-	if err := s.configClient.DeleteUserConfig(ctx, token, user.Subject, in.AccountID); err != nil {
+	if err := s.configStore.DeleteUserConfig(ctx, user.Subject, in.AccountID); err != nil {
 		if errors.Is(err, config.ErrConfigNotFound) {
 			return nil, nil, errors.New("account not found")
 		}
@@ -643,21 +721,17 @@ func (s *Server) sendEmail(ctx context.Context, req *mcp.CallToolRequest, in Sen
 
 // --- Helpers ---
 
-func (s *Server) requireAuth(ctx context.Context) (*UserInfo, string, error) {
+func (s *Server) requireAuth(ctx context.Context) (*UserInfo, error) {
 	userInfo, ok := UserFromContext(ctx)
 	if !ok {
-		return nil, "", errors.New("authentication required: provide a valid session token")
+		return nil, errors.New("authentication required: provide a valid session token")
 	}
-	token, ok := TokenFromContext(ctx)
-	if !ok || token == "" {
-		return nil, "", errors.New("authentication token required")
-	}
-	return userInfo, token, nil
+	return userInfo, nil
 }
 
-// getAccount loads an authenticated user's email account from the Config API.
+// getAccount loads an authenticated user's email account from the config store.
 func (s *Server) getAccount(ctx context.Context, accountID string) (*types.Account, error) {
-	userInfo, token, err := s.requireAuth(ctx)
+	userInfo, err := s.requireAuth(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -666,32 +740,21 @@ func (s *Server) getAccount(ctx context.Context, accountID string) (*types.Accou
 		return nil, errors.New("account_id is required")
 	}
 
-	s.logger.Debug("fetching config from API", "user", userInfo.Email, "account_id", accountID)
-	accs, err := s.configClient.GetUserConfig(ctx, token, userInfo.Subject, accountID)
+	s.logger.Debug("fetching config from store", "user", userInfo.Email, "account_id", accountID)
+	acc, err := s.configStore.GetUserConfig(ctx, userInfo.Subject, accountID)
 	if err != nil {
 		if errors.Is(err, config.ErrConfigNotFound) {
 			return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
 		}
-		return nil, fmt.Errorf("fetch config from api: %w", err)
+		return nil, fmt.Errorf("fetch config from store: %w", err)
 	}
 
-	if len(accs) == 0 {
-		return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
+	// Bind ownership for pool isolation and re-validate host/TLS policy.
+	acc.OwnerUserID = userInfo.Subject
+	if err := validateAccountEndpoints(acc); err != nil {
+		return nil, err
 	}
-
-	// Try to find the exact match by ID if multiple are returned.
-	for _, acc := range accs {
-		if acc.ID == accountID {
-			// Bind ownership for pool isolation and re-validate host/TLS policy.
-			acc.OwnerUserID = userInfo.Subject
-			if err := validateAccountEndpoints(acc); err != nil {
-				return nil, err
-			}
-			return acc, nil
-		}
-	}
-
-	return nil, fmt.Errorf("account %q not found; call add_email_account first", accountID)
+	return acc, nil
 }
 
 // validateAccountEndpoints enforces SSRF and TLS policy on stored config before dial.

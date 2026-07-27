@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This repository contains **EmailMCP** — a production-grade MCP (Model Context Protocol) server written in Go that exposes IMAP and SMTP email capabilities as MCP tools for AI agents. All code lives in `emailmcp/`. Account configuration is loaded exclusively from the remote Config API (no local database).
+This repository contains **EmailMCP** — a production-grade MCP (Model Context Protocol) server written in Go that exposes IMAP and SMTP email capabilities as MCP tools for AI agents. All code lives in `emailmcp/`. Account configuration is loaded exclusively from DynamoDB (no local database).
 
 ## Commands
 
@@ -28,7 +28,7 @@ go build ./...                         # verify everything compiles
 ./run.sh clean         # remove binaries and build artifacts
 ```
 
-The server requires `CONFIG_API_URL` and `GOOGLE_CLIENT_ID` to start. HTTP mode also requires `GOOGLE_CLIENT_SECRET` and `PUBLIC_BASE_URL` for the MCP OAuth authorization-code proxy to Google. The `run.sh` script loads them from `emailmcp/.env` automatically. If `CONFIG_API_URL` is unset, startup may resolve it from SSM parameter `/emailmcp/config-api/url` when `AWS_REGION` and credentials are available.
+The server requires `EMAILMCP_USER_CONFIG_TABLE` and `GOOGLE_CLIENT_ID` to start. HTTP mode also requires `GOOGLE_CLIENT_SECRET` and `PUBLIC_BASE_URL` for the MCP OAuth authorization-code proxy to Google. The `run.sh` script loads them from `emailmcp/.env` automatically. If `EMAILMCP_USER_CONFIG_TABLE` is unset, startup may resolve it from SSM parameter `/emailmcp/user-config-table/name` when `AWS_REGION` and credentials are available.
 
 ## Architecture
 
@@ -36,14 +36,14 @@ The server requires `CONFIG_API_URL` and `GOOGLE_CLIENT_ID` to start. HTTP mode 
 emailmcp/
   cmd/emailmcp/         Entry point — wires together config and server
   internal/
-    config/             Env-based config + Config API HTTP client (SigV4)
+    config/             Env-based config + DynamoDB store (AWS SDK)
     imap/               Per-account connection pool + all IMAP operations (go-imap/v2)
     smtp/               Stateless per-send SMTP client (jordan-wright/email)
     server/             MCP server setup, Google auth, tool registration and handlers
     types/              Shared domain types (Account, EmailSummary, EmailMessage, etc.)
 ```
 
-**Request flow:** MCP client (Google ID token) → Streamable HTTP → auth middleware → `server.go` handler → Config API for account → `imap.Manager` or `smtp.Sender`.
+**Request flow:** MCP client (Google ID token) → Streamable HTTP → auth middleware → `server.go` handler → `config.Store` for account → `imap.Manager` or `smtp.Sender`.
 
 ### MCP Tool Registration
 
@@ -51,11 +51,11 @@ All tools are registered in `server.go:registerTools()` using `mcp.AddTool`. Han
 
 ### Account storage
 
-There is **no local SQLite or other local account store**. Each authenticated Google user has one account configuration stored via the Config API (DynamoDB metadata + Secrets Manager password). Tools:
+There is **no local SQLite or other local account store**. Each authenticated Google user has one account configuration stored in DynamoDB (metadata + encrypted password). Tools:
 
-- `add_email_account` → PUT Config API
-- `list_email_accounts` → GET Config API (0 or 1 account)
-- `remove_email_account` → DELETE Config API
+- `add_email_account` → PUT DynamoDB
+- `list_email_accounts` → GET DynamoDB (0 or 1 account)
+- `remove_email_account` → DELETE DynamoDB
 
 ### IMAP Connection Pool
 
@@ -74,7 +74,7 @@ Pools are keyed by `(OwnerUserID, accountID)` so two users with the same account
 
 ### Credential Handling
 
-Passwords are returned by the Config API as plaintext fields on `types.Account` (`IMAPPassword` / `SMTPPassword`) for the lifetime of the operation. Never log them. When `SMTPPassword` is empty, SMTP falls back to `IMAPPassword`.
+Passwords are returned from DynamoDB as plaintext fields on `types.Account` (`IMAPPassword` / `SMTPPassword`) for the lifetime of the operation. Never log them. When `SMTPPassword` is empty, SMTP falls back to `IMAPPassword`.
 
 ### Transports
 

@@ -5,7 +5,7 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 ## Features
 
 ### IMAP (Inbound)
-- Credentials loaded from AWS Secrets Manager via the Config API
+- Credentials loaded from Amazon DynamoDB
 - Robust per-account IMAP connection pooling with health checks and limits
 - List folders
 - Search emails (text, from, since, etc.)
@@ -14,9 +14,9 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 
 ### Multi-User & Cloud Architecture
 - **Google OAuth2 Authentication**: MCP OAuth 2.1 discovery + authorization-code flow that fronts Google sign-in; Google ID tokens authorize MCP traffic.
-- **Remote Storage**: Account configuration in Amazon DynamoDB and sensitive credentials in AWS Secrets Manager.
+- **Remote Storage**: Account configuration and encrypted credentials in Amazon DynamoDB.
 - **AWS CDK Infrastructure**: Fully automated resource provisioning using TypeScript.
-- **Config API Layer**: Lightweight Python Lambda gateway for configuration management.
+- **Direct DynamoDB Storage**: The Go server reads/writes configuration directly to DynamoDB via IRSA.
 
 ### SMTP (Outbound)
 - Send plain text + HTML emails
@@ -32,10 +32,9 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 
 - Go 1.25+ (due to MCP SDK)
 - Node.js & npm (for CDK infrastructure)
-- Python 3.12 (for Config API Lambda)
 - AWS CLI configured with appropriate credentials
 - Google OAuth2 Client ID
-- Config API URL (from CDK deploy, or resolvable via SSM)
+- DynamoDB Table Name (auto-resolvable via SSM)
 
 ## Quick Start (Cloud Deployment)
 
@@ -50,7 +49,7 @@ The cloud deployment provisions a multi-user environment using AWS CDK.
 ./run.sh deploy cloud dev --context googleClientId=YOUR_GOOGLE_CLIENT_ID
 ```
 
-The `run.sh` script automates building the Go binary, packaging the Lambda, and deploying the CDK stack. After deployment, note the `ConfigApiUrl` output for your MCP server configuration.
+The `run.sh` script automates building the Go binary and deploying the CDK stack. After deployment, note the `UserConfigTableName` output for your MCP server configuration.
 
 ## Local Quick Start
 
@@ -63,14 +62,14 @@ go build -o emailmcp ./cmd/emailmcp
 
 # 2. Configure
 cp .env.example .env
-# Edit .env and set CONFIG_API_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
-# and PUBLIC_BASE_URL (CONFIG_API_URL can also be resolved from SSM)
+# Edit .env and set EMAILMCP_USER_CONFIG_TABLE, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+# and PUBLIC_BASE_URL (EMAILMCP_USER_CONFIG_TABLE can also be resolved from SSM)
 
 # 3. Run
 ./run.sh run
 ```
 
-The server listens on `:8080` by default and serves the Streamable HTTP transport at `/`. Startup refuses to serve if the Config API health check fails.
+The server listens on `:8080` by default and serves the Streamable HTTP transport at `/`. Startup fails if the configured DynamoDB table is unreachable.
 
 ### Installation (System-wide)
 
@@ -88,7 +87,7 @@ The wrapper script automatically loads configuration from `~/.emailmcp`. You sho
 
 ```bash
 # Example ~/.emailmcp
-CONFIG_API_URL=https://your-config-api.lambda-url.region.on.aws/
+EMAILMCP_USER_CONFIG_TABLE=EmailMCPUserConfigs
 GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
 GOOGLE_CLIENT_SECRET=your-google-client-secret
 PUBLIC_BASE_URL=https://emailmcp.ecg.co
@@ -120,7 +119,7 @@ To remove the deployment from EKS:
 
 | Tool                  | Description                                              |
 |-----------------------|----------------------------------------------------------|
-| `add_email_account`   | Create/replace the user's IMAP + SMTP account (Config API)|
+| `add_email_account`   | Create/replace the user's IMAP + SMTP account          |
 | `list_email_accounts` | List the user's account (no secrets)                     |
 | `remove_email_account`| Delete the user's account config                         |
 | `list_folders`        | List IMAP mailboxes                                      |
@@ -135,7 +134,7 @@ Account tools require an `account_id` parameter to specify which email account t
 
 ## Configuration
 
-EmailMCP uses **remote account storage only** (Config API → DynamoDB + Secrets Manager).
+EmailMCP uses **remote account storage only** (DynamoDB).
 
 ### Cloud Deployment Variables
 
@@ -151,11 +150,11 @@ See `.env.example`. Key variables for the MCP server:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CONFIG_API_URL` | Yes* | Config API Function URL. *May be resolved from SSM `/emailmcp/config-api/url`. |
+| `EMAILMCP_USER_CONFIG_TABLE` | No | DynamoDB table storing per-user email account configurations. Resolved from SSM `/emailmcp/user-config-table/name` when unset. Falls back to an in-memory store if neither is set. |
 | `GOOGLE_CLIENT_ID` | Yes | Google OAuth2 Client ID for ID token verification. |
 | `GOOGLE_CLIENT_SECRET` | Yes (HTTP) | Google client secret for the MCP OAuth authorize/token proxy. |
 | `PUBLIC_BASE_URL` | Yes (HTTP) | Public origin (issuer + OAuth redirect base), e.g. `https://emailmcp.ecg.co`. |
-| `EMAILMCP_JWT_SECRET` | Yes (EKS/HTTP prod) | Signing key for the session JWTs issued after Google sign-in (1h access token + 7d refresh token). Required for stable sessions across restarts/replicas; passed to the pod via `deploy/eks/secret.yaml`. A random key is generated when unset (local-only). |
+| `EMAILMCP_SESSION_TABLE` | No | DynamoDB table storing OAuth sessions (opaque access/refresh tokens) and registered clients. Resolved from SSM `/emailmcp/session-table/name` when unset. Falls back to an in-memory store (sessions do not survive a restart or span replicas) if neither is set. |
 | `OAUTH_REDIRECT_ALLOWLIST` | No | Comma-separated HTTPS OAuth `redirect_uri` allowlist (host, `*.host`, or `https://…` URI). **Empty = not enforced** (any HTTPS host allowed). Loopback HTTP and custom schemes always allowed. Passed to EKS via ConfigMap. |
 | `APPLICATION_ID` | No | Application partition key (default: `default`). |
 | `EMAILMCP_LOG_LEVEL` | No | `debug`, `info` (default), `warn`, `error`. |
@@ -172,7 +171,7 @@ See `.env.example`. Key variables for the MCP server:
 ```bash
 docker build -t emailmcp .
 docker run \
-  -e CONFIG_API_URL=... \
+  -e EMAILMCP_USER_CONFIG_TABLE=... \
   -e GOOGLE_CLIENT_ID=... \
   -e GOOGLE_CLIENT_SECRET=... \
   -e PUBLIC_BASE_URL=https://emailmcp.ecg.co \
@@ -180,7 +179,7 @@ docker run \
   -p 8080:8080 emailmcp
 ```
 
-The container needs AWS credentials (or IRSA on EKS) to call the Config API Function URL with SigV4.
+The container needs AWS credentials (or IRSA on EKS) to access DynamoDB.
 
 ## EKS Deployment
 
@@ -191,7 +190,7 @@ EmailMCP can be deployed to Amazon EKS using the provided Kubernetes manifests a
 1.  An existing EKS cluster.
 2.  `kubectl` configured to point to your cluster.
 3.  `aws` CLI configured with appropriate permissions.
-4.  Infrastructure deployed via CDK (to create ECR and Config API):
+4.  Infrastructure deployed via CDK (to create ECR and DynamoDB tables):
     ```bash
     ./run.sh deploy cloud
     ```
@@ -219,7 +218,7 @@ EmailMCP can be deployed to Amazon EKS using the provided Kubernetes manifests a
 4.  **Access the Server**:
     The service is exposed via an AWS Application Load Balancer (ALB) at `http://emailmcp.ecg.co`. Ensure your DNS or `/etc/hosts` points `emailmcp.ecg.co` to the ALB's external DNS name (found in `eks-status`).
 
-Account configuration is always remote (DynamoDB / Secrets Manager via Config API). The pod is stateless — no persistent volume is required for account data.
+Account configuration is always remote (DynamoDB). The pod is stateless — no persistent volume is required for account data.
 
 ## Claude Desktop Integration
 
@@ -250,7 +249,7 @@ Otherwise, you can run it from your source directory (requires absolute paths):
       "command": "/absolute/path/to/EmailMCP/emailmcp",
       "args": ["-transport", "stdio"],
       "env": {
-        "CONFIG_API_URL": "https://your-config-api.lambda-url.region.on.aws/",
+        "EMAILMCP_USER_CONFIG_TABLE": "EmailMCPUserConfigs",
         "GOOGLE_CLIENT_ID": "your-google-client-id.apps.googleusercontent.com"
       }
     }
@@ -279,9 +278,7 @@ graph TD
 
     subgraph "AWS Infrastructure"
         MCP[EmailMCP Server <br/> Go]
-        Lambda[Config API <br/> Python Lambda]
-        DDB[(DynamoDB <br/> Metadata)]
-        SM[Secrets Manager <br/> Credentials]
+        DDB[(DynamoDB <br/> User Configs)]
     end
 
     Client -- "1. MCP OAuth (or Bearer ID token)" --> MCP
@@ -289,12 +286,8 @@ graph TD
     Google -. "3. /oauth/callback + ID token" .-> MCP
     Client -- "4. Bearer Google ID Token" --> MCP
     MCP -. "5. Validate Token" .-> Google
-    MCP -- "6. Get Config (SigV4 + Google token)" --> Lambda
-    Lambda -. "7. Validate Token" .-> Google
-    Lambda -- "8. Query Metadata" --> DDB
-    Lambda -- "9. Fetch Secrets" --> SM
-    Lambda -- "10. Return Config" --> MCP
-    MCP -- "11. IMAP/SMTP ops" --> EmailSvc
+    MCP -- "6. Get Config (AWS SDK)" --> DDB
+    MCP -- "7. IMAP/SMTP ops" --> EmailSvc
 
     %% Styling
     classDef highlight fill:#f9f,stroke:#333,stroke-width:2px;
@@ -305,11 +298,8 @@ graph TD
 
 EmailMCP is ready for cloud-native deployment with the following components:
 
-- **Go MCP Server**: Validates Google ID tokens and dynamically fetches per-user configuration.
-- **Python Config API (AWS Lambda)**: Serves as a secure gateway between the MCP server and storage, protected by AWS IAM authentication.
-- **Hybrid Storage**:
-  - **DynamoDB**: Stores non-sensitive user metadata and IMAP/SMTP server settings.
-  - **Secrets Manager**: Securely stores IMAP passwords, indexed by `applicationId` and `userId`.
+- **Go MCP Server**: Validates Google ID tokens and dynamically fetches per-user configuration directly from DynamoDB.
+- **DynamoDB Storage**: Stores user metadata and encrypted IMAP/SMTP credentials (encrypted at rest with KMS).
 - **AWS CDK**: Defines and provisions all resources including KMS keys for encryption, IAM roles for least-privilege access, and CloudTrail for audit logging.
 
 For more details on the deployment process, see the root-level `run.sh` script and the `infrastructure/` directory.
@@ -320,7 +310,7 @@ For more details on the deployment process, see the root-level `run.sh` script a
 emailmcp/
   cmd/emailmcp          - Entry point
   internal/
-    config/             - Env config + Config API client (SigV4)
+    config/             - Env config + DynamoDB store (SDK)
     imap/               - Connection pool + operations (go-imap/v2)
     smtp/               - Sending logic (jordan-wright/email)
     server/             - MCP server, Google auth, tool registration
@@ -338,7 +328,7 @@ go build ./...
 ## Security Notes
 
 - Never log credentials or full email bodies in production.
-- Account secrets live only in Secrets Manager; EmailMCP does not persist them.
+- Account secrets live only in DynamoDB (encrypted); EmailMCP does not persist them.
 - Use TLS for IMAP/SMTP in production.
 - Consider running behind a reverse proxy if exposing publicly; MCP routes already require Google ID tokens.
 
@@ -354,8 +344,7 @@ These costs are incurred once the infrastructure is deployed, regardless of usag
 | **Amazon EKS** | Control Plane ($0.10/hour) | $73.00 |
 | **Application Load Balancer** | ALB Ingress ($0.0225/hour + LCU) | $16.50 |
 | **AWS KMS** | 1 Customer Managed Key (CMK) | $1.00 |
-| **Secrets Manager** | 1 Secret (IMAP Credentials) | $0.40 |
-| **Total Fixed Costs** | | **$90.90** |
+| **Total Fixed Costs** | | **$90.50** |
 
 ### 2. Variable Usage Costs (Monthly)
 These costs scale with the number of checks and summaries performed.
@@ -364,19 +353,17 @@ These costs scale with the number of checks and summaries performed.
 | :--- | :--- | :--- |
 | **AWS Bedrock (LLM)** | Claude 3.5 Sonnet (2,880 summaries) | $25.92 |
 | **AWS Fargate** | 0.5 vCPU / 1GB RAM for Go MCP Server | $18.02 |
-| **AWS Lambda** | 2,880 Config API calls (256MB, <500ms) | < $0.05 |
 | **Amazon DynamoDB** | ~5,760 Read/Write Units (On-demand) | < $0.01 |
-| **Secrets Manager API** | ~2,880 API calls | $0.02 |
-| **Total Variable Costs** | | **$44.01** |
+| **Total Variable Costs** | | **$43.94** |
 
 ### 3. Total Cost Estimate
 
-*   **Dedicated Environment (Single User)**: ~$134.91 / month
-*   **Shared Environment (Incremental Cost)**: ~$44.01 / month
+*   **Dedicated Environment (Single User)**: ~$134.44 / month
+*   **Shared Environment (Incremental Cost)**: ~$43.94 / month
 
 ### 4. Cost Optimization Opportunities
 *   **Lower-cost Model**: Switching to **Claude 3 Haiku** for summarization reduces Bedrock costs to ~$2.16/month.
 *   **Lambda-based Hosting**: Adapting the Go MCP server to run on AWS Lambda or App Runner could eliminate the fixed EKS/ALB costs.
-*   **Local Execution**: Running the MCP server locally and only calling the AWS Config API and Bedrock costs ~$27.32/month.
+*   **Local Execution**: Running the MCP server locally and only calling DynamoDB and Bedrock costs ~$27.32/month.
 
 *Note: Prices are based on `us-east-1` region. Bedrock costs assume 2,000 input tokens and 200 output tokens per summary.*

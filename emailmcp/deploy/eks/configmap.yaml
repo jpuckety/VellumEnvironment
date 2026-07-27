@@ -4,7 +4,6 @@ metadata:
   name: emailmcp-config
   namespace: emailmcp
 data:
-  CONFIG_API_URL: "${CONFIG_API_URL}"
   AWS_REGION: "${AWS_REGION}"
   GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID}"
   APPLICATION_ID: "${APPLICATION_ID}"

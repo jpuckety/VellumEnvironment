@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,28 +23,38 @@ const (
 	oauthCodeTTL    = 5 * time.Minute
 	oauthPendingTTL = 15 * time.Minute
 	oauthClientTTL  = 90 * 24 * time.Hour
+
+	// accessTokenTTL bounds the lifetime of the opaque access token issued to
+	// MCP clients. It is further capped by the embedded Google ID token expiry
+	// so the token forwarded downstream is always valid while the session is.
+	accessTokenTTL = time.Hour
+	// refreshTokenTTL is the lifetime of the opaque refresh token paired with
+	// the access token for longer-lived access.
+	refreshTokenTTL = 30 * 24 * time.Hour
 )
 
 // OAuthServer is a thin OAuth 2.1 authorization server that fronts Google
-// sign-in for MCP clients. After Google verifies the user it issues the
-// server's own short-lived JWT as the access_token (paired with a longer-lived
-// refresh token). The Google ID token is embedded in the JWT so downstream
-// EmailMCP / Config API verification continues to work.
+// sign-in for MCP clients. After Google verifies the user it issues an opaque
+// access_token (paired with a longer-lived opaque refresh token) and persists
+// the session in the SessionStore. The Google ID token is stored with the
+// session and forwarded downstream so EmailMCP / Config API verification
+// continues to work.
 type OAuthServer struct {
 	baseURL      string
 	googleConfig *oauth2.Config
-	tokens       *TokenIssuer
+	store        SessionStore
 	logger       *slog.Logger
 	httpClient   *http.Client
 	// redirectAllowlist restricts HTTPS redirect_uris when non-empty.
 	// Empty means allowlist enforcement is off (any HTTPS host is accepted).
 	redirectAllowlist []string
 
+	// Sessions and registered clients live in the SessionStore. Only the
+	// short-lived authorization codes and pending authorizations are kept
+	// process-local here.
 	mu        sync.Mutex
-	pending   map[string]*pendingAuth  // google state -> pending
-	codes     map[string]*issuedCode   // auth code -> issued
-	refresh   map[string]*refreshEntry // our refresh token -> entry
-	clients   map[string]*oauthClient  // client_id -> registration
+	pending   map[string]*pendingAuth // google state -> pending
+	codes     map[string]*issuedCode  // auth code -> issued
 	cleanupAt time.Time
 }
 
@@ -69,27 +80,11 @@ type issuedCode struct {
 	ExpiresAt           time.Time
 }
 
-type refreshEntry struct {
-	ClientID      string
-	Subject       string
-	Email         string
-	GoogleRefresh string
-	ExpiresAt     time.Time
-}
-
-type oauthClient struct {
-	ClientID     string
-	ClientSecret string
-	RedirectURIs []string
-	ClientName   string
-	ExpiresAt    time.Time
-}
-
-// NewOAuthServer builds the Google-backed OAuth authorization server. tokens is
-// used to mint the short-lived session JWTs returned as access_tokens.
-// redirectAllowlist restricts HTTPS redirect_uris when non-empty; empty means
-// the allowlist is not enforced.
-func NewOAuthServer(baseURL, clientID, clientSecret string, tokens *TokenIssuer, logger *slog.Logger, redirectAllowlist []string) (*OAuthServer, error) {
+// NewOAuthServer builds the Google-backed OAuth authorization server. store
+// persists the issued sessions (opaque access/refresh tokens) and registered
+// clients. redirectAllowlist restricts HTTPS redirect_uris when non-empty;
+// empty means the allowlist is not enforced.
+func NewOAuthServer(baseURL, clientID, clientSecret string, store SessionStore, logger *slog.Logger, redirectAllowlist []string) (*OAuthServer, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("PUBLIC_BASE_URL is required for OAuth")
@@ -97,8 +92,8 @@ func NewOAuthServer(baseURL, clientID, clientSecret string, tokens *TokenIssuer,
 	if clientID == "" || clientSecret == "" {
 		return nil, fmt.Errorf("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required for OAuth")
 	}
-	if tokens == nil {
-		return nil, fmt.Errorf("token issuer is required for OAuth")
+	if store == nil {
+		return nil, fmt.Errorf("session store is required for OAuth")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -119,14 +114,12 @@ func NewOAuthServer(baseURL, clientID, clientSecret string, tokens *TokenIssuer,
 			Scopes:       []string{"openid", "email", "profile"},
 			Endpoint:     google.Endpoint,
 		},
-		tokens:            tokens,
+		store:             store,
 		logger:            logger,
 		httpClient:        http.DefaultClient,
 		redirectAllowlist: allowlist,
 		pending:           make(map[string]*pendingAuth),
 		codes:             make(map[string]*issuedCode),
-		refresh:           make(map[string]*refreshEntry),
-		clients:           make(map[string]*oauthClient),
 	}, nil
 }
 
@@ -223,14 +216,16 @@ func (o *OAuthServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o.mu.Lock()
-	o.clients[clientID] = &oauthClient{
+	if err := o.store.PutClient(r.Context(), &ClientRegistration{
 		ClientID:     clientID,
 		RedirectURIs: append([]string(nil), req.RedirectURIs...),
 		ClientName:   req.ClientName,
 		ExpiresAt:    time.Now().Add(oauthClientTTL),
+	}); err != nil {
+		o.logger.Error("failed to persist oauth client", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
-	o.mu.Unlock()
 
 	o.logger.Info("oauth client registered", "client_id", clientID, "name", req.ClientName)
 
@@ -274,15 +269,16 @@ func (o *OAuthServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o.mu.Lock()
-	client, ok := o.clients[clientID]
-	if ok {
-		if time.Now().After(client.ExpiresAt) {
-			delete(o.clients, clientID)
-			ok = false
-		}
+	client, err := o.store.GetClient(r.Context(), clientID)
+	ok := err == nil
+	if err != nil && !errors.Is(err, ErrClientNotFound) {
+		o.logger.Error("failed to load oauth client", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
-	o.mu.Unlock()
+	if ok && time.Now().After(client.ExpiresAt) {
+		ok = false
+	}
 
 	// Allow unknown clients only when redirect URI is a loopback (common for
 	// MCP clients that skip DCR or use Client ID Metadata Documents).
@@ -361,7 +357,7 @@ func (o *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cryptographically verify the Google ID token (signature, aud, iss, exp).
-	if _, _, err := verifyGoogleIDToken(ctx, idToken, o.googleConfig.ClientID); err != nil {
+	if _, _, _, err := verifyGoogleIDToken(ctx, idToken, o.googleConfig.ClientID); err != nil {
 		o.logger.Error("google id token verification failed after code exchange", "error", err)
 		http.Error(w, "failed to verify Google identity token", http.StatusBadGateway)
 		return
@@ -457,44 +453,66 @@ func (o *OAuthServer) tokenAuthorizationCode(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Re-verify the Google ID token before minting a session JWT.
-	subject, email, err := verifyGoogleIDToken(r.Context(), issued.IDToken, o.googleConfig.ClientID)
+	// Re-verify the Google ID token before issuing a session.
+	subject, email, gExpiry, err := verifyGoogleIDToken(r.Context(), issued.IDToken, o.googleConfig.ClientID)
 	if err != nil {
 		o.logger.Error("google id token verification failed at token endpoint", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "identity token is no longer valid; re-authorize")
 		return
 	}
-	// Issue our own short-lived session JWT (1h). The Google ID token is embedded
-	// so downstream Config API calls can still present a genuine Google token.
-	accessToken, expiry, err := o.tokens.Issue(subject, email, issued.IDToken)
+
+	accessToken, err := randomToken(32)
 	if err != nil {
-		o.logger.Error("failed to issue session jwt", "error", err)
+		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue access token")
+		return
+	}
+	refreshToken, err := randomToken(32)
+	if err != nil {
+		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue refresh token")
+		return
+	}
+
+	// Store the session keyed by the opaque access token. The Google ID token is
+	// kept with the session and forwarded downstream so the Config API can still
+	// verify a genuine Google token.
+	accessExpiry := accessTokenExpiry(gExpiry)
+	sess := &Session{
+		AccessToken:      accessToken,
+		RefreshToken:     refreshToken,
+		ClientID:         issued.ClientID,
+		Subject:          subject,
+		Email:            email,
+		GoogleIDToken:    issued.IDToken,
+		GoogleRefresh:    issued.GoogleRefresh,
+		AccessExpiresAt:  accessExpiry,
+		RefreshExpiresAt: time.Now().Add(refreshTokenTTL),
+	}
+	if err := o.store.PutSession(r.Context(), sess); err != nil {
+		o.logger.Error("failed to persist session", "error", err)
 		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue access token")
 		return
 	}
 
-	resp := map[string]any{
-		"access_token": accessToken,
-		"token_type":   "Bearer",
-		"expires_in":   int(time.Until(expiry).Seconds()),
-		"scope":        "openid email profile",
-	}
+	o.logger.Info("session issued", "subject", subject, "client_id", issued.ClientID)
 
-	// Pair the JWT with a refresh token (7 days) for longer-lived access.
-	if ourRefresh, err := randomToken(32); err == nil {
-		o.mu.Lock()
-		o.refresh[ourRefresh] = &refreshEntry{
-			ClientID:      issued.ClientID,
-			Subject:       subject,
-			Email:         email,
-			GoogleRefresh: issued.GoogleRefresh,
-			ExpiresAt:     time.Now().Add(refreshTokenTTL),
-		}
-		o.mu.Unlock()
-		resp["refresh_token"] = ourRefresh
-	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"access_token":  accessToken,
+		"token_type":    "Bearer",
+		"expires_in":    int(time.Until(accessExpiry).Seconds()),
+		"refresh_token": refreshToken,
+		"scope":         "openid email profile",
+	})
+}
 
-	writeJSON(w, http.StatusOK, resp)
+// accessTokenExpiry returns the access-token expiry: now+accessTokenTTL, capped
+// by the Google ID token expiry (when known) so the token forwarded downstream
+// stays valid for as long as the access token we hand out.
+func accessTokenExpiry(googleExpiry time.Time) time.Time {
+	expiry := time.Now().Add(accessTokenTTL)
+	if !googleExpiry.IsZero() && googleExpiry.Before(expiry) {
+		return googleExpiry
+	}
+	return expiry
 }
 
 func (o *OAuthServer) tokenRefresh(w http.ResponseWriter, r *http.Request) {
@@ -504,19 +522,21 @@ func (o *OAuthServer) tokenRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	o.mu.Lock()
-	entry, ok := o.refresh[refreshToken]
-	if ok && time.Now().After(entry.ExpiresAt) {
-		delete(o.refresh, refreshToken)
-		ok = false
+	sess, err := o.store.GetSessionByRefreshToken(r.Context(), refreshToken)
+	if err != nil {
+		if !errors.Is(err, ErrSessionNotFound) {
+			o.logger.Error("failed to load session for refresh", "error", err)
+		}
+		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh_token")
+		return
 	}
-	o.mu.Unlock()
-	if !ok {
+	if time.Now().After(sess.RefreshExpiresAt) {
+		_ = o.store.DeleteSession(r.Context(), sess.AccessToken)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired refresh_token")
 		return
 	}
 
-	tok := &oauth2.Token{RefreshToken: entry.GoogleRefresh}
+	tok := &oauth2.Token{RefreshToken: sess.GoogleRefresh}
 	src := o.googleConfig.TokenSource(r.Context(), tok)
 	newTok, err := src.Token()
 	if err != nil {
@@ -531,39 +551,61 @@ func (o *OAuthServer) tokenRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rotate refresh token if Google issued a new one.
-	if newTok.RefreshToken != "" && newTok.RefreshToken != entry.GoogleRefresh {
-		o.mu.Lock()
-		entry.GoogleRefresh = newTok.RefreshToken
-		o.mu.Unlock()
-	}
-
-	// Mint a fresh session JWT after verifying the new Google ID token.
-	subject, email, err := verifyGoogleIDToken(r.Context(), idToken, o.googleConfig.ClientID)
+	// Verify the new Google ID token before minting a fresh access token.
+	subject, email, gExpiry, err := verifyGoogleIDToken(r.Context(), idToken, o.googleConfig.ClientID)
 	if err != nil {
 		o.logger.Error("google id token verification failed on refresh", "error", err)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "identity token is no longer valid; re-authorize")
 		return
 	}
 	if subject == "" {
-		subject = entry.Subject
+		subject = sess.Subject
 	}
 	if email == "" {
-		email = entry.Email
+		email = sess.Email
 	}
-	accessToken, expiry, err := o.tokens.Issue(subject, email, idToken)
+
+	newAccess, err := randomToken(32)
 	if err != nil {
-		o.logger.Error("failed to issue session jwt on refresh", "error", err)
 		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue access token")
 		return
 	}
 
+	// Rotate the Google refresh token if Google issued a new one.
+	googleRefresh := sess.GoogleRefresh
+	if newTok.RefreshToken != "" && newTok.RefreshToken != googleRefresh {
+		googleRefresh = newTok.RefreshToken
+	}
+
+	accessExpiry := accessTokenExpiry(gExpiry)
+	// Rotate the access token but keep the (stable) refresh token; preserve the
+	// refresh token's original expiry so sessions are not extended indefinitely.
+	newSess := &Session{
+		AccessToken:      newAccess,
+		RefreshToken:     refreshToken,
+		ClientID:         sess.ClientID,
+		Subject:          subject,
+		Email:            email,
+		GoogleIDToken:    idToken,
+		GoogleRefresh:    googleRefresh,
+		AccessExpiresAt:  accessExpiry,
+		RefreshExpiresAt: sess.RefreshExpiresAt,
+	}
+	if err := o.store.PutSession(r.Context(), newSess); err != nil {
+		o.logger.Error("failed to persist refreshed session", "error", err)
+		oauthError(w, http.StatusInternalServerError, "server_error", "failed to issue access token")
+		return
+	}
+	if sess.AccessToken != newAccess {
+		_ = o.store.DeleteSession(r.Context(), sess.AccessToken)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  accessToken,
+		"access_token":  newAccess,
 		"token_type":    "Bearer",
-		"expires_in":    int(time.Until(expiry).Seconds()),
-		"scope":         "openid email profile",
+		"expires_in":    int(time.Until(accessExpiry).Seconds()),
 		"refresh_token": refreshToken,
+		"scope":         "openid email profile",
 	})
 }
 
@@ -601,16 +643,6 @@ func (o *OAuthServer) cleanupLocked() {
 	for k, v := range o.codes {
 		if now.After(v.ExpiresAt) {
 			delete(o.codes, k)
-		}
-	}
-	for k, v := range o.refresh {
-		if now.After(v.ExpiresAt) {
-			delete(o.refresh, k)
-		}
-	}
-	for k, v := range o.clients {
-		if now.After(v.ExpiresAt) {
-			delete(o.clients, k)
 		}
 	}
 }

@@ -2,11 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
@@ -20,7 +17,6 @@ func TestGetAccount_RequiredAccountID(t *testing.T) {
 
 	// Mock authenticated context
 	ctx := context.WithValue(context.Background(), userContextKey, &UserInfo{Subject: "user1", Email: "user1@example.com"})
-	ctx = context.WithValue(ctx, tokenContextKey, "fake-token")
 
 	// Call with empty accountID
 	_, err := s.getAccount(ctx, "")
@@ -33,21 +29,21 @@ func TestGetAccount_RequiredAccountID(t *testing.T) {
 }
 
 func TestListEmailAccounts_ReturnsMap(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]types.Account{
-			{ID: "acc1", Name: "Account 1"},
-		})
-	}))
-	defer ts.Close()
+	// In-memory config store (no DynamoDB table configured).
+	store, err := config.NewStore(context.Background(), "", "emailmcp", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	if err := store.PutUserConfig(context.Background(), "user1", &types.Account{ID: "acc1", Name: "Account 1"}); err != nil {
+		t.Fatalf("PutUserConfig failed: %v", err)
+	}
 
 	s := &Server{
-		configClient: config.NewClient(ts.URL, "emailmcp"),
-		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		configStore: store,
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	ctx := context.WithValue(context.Background(), userContextKey, &UserInfo{Subject: "user1", Email: "user1@example.com"})
-	ctx = context.WithValue(ctx, tokenContextKey, "fake-token")
 
 	_, result, err := s.listEmailAccounts(ctx, nil, struct{}{})
 	if err != nil {

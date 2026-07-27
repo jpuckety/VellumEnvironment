@@ -18,7 +18,6 @@
 set -euo pipefail
 
 APP_DIR="emailmcp"
-LAMBDA_DIR="emailmcp-config-api"
 INFRA_DIR="infrastructure"
 K8S_NAMESPACE="emailmcp"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
@@ -66,7 +65,6 @@ Build & Test Commands:
   test            Run all Go tests
   vet             Run go vet
   check           Run test + vet
-  package-lambda  Package the Python Config API Lambda
   clean           Remove build artifacts
 
 Utilities:
@@ -78,7 +76,7 @@ Examples:
   ./run.sh build-push
   ./run.sh eks-status
 
-IRSA / OIDC (required for EKS → Config API):
+IRSA / OIDC (required for EKS → AWS access):
   Set EKS_OIDC_PROVIDER_ARN in emailmcp/.env (preferred), or in the gitignored
   file infrastructure/cdk.local.json. Without it, infra-deploy refuses to run
   so the IRSA role is not removed. Escape hatch: ALLOW_NO_IRSA=1
@@ -156,16 +154,15 @@ cmd_eks_deploy() {
   log_info "Ensuring infrastructure is up to date..."
   cmd_infra_deploy
   local repo_uri=$(get_cdk_output "EcrRepositoryUri")
-  local config_api_url=$(get_cdk_output "ConfigApiUrl")
   local irsa_role_arn=$(get_cdk_output "IrsaRoleArn")
   local cert_arn="${EKS_CERTIFICATE_ARN:-}"
   if [[ -z "$cert_arn" ]]; then
     cert_arn=$(get_cdk_output "CertificateArn")
   fi
   
-  if [[ -z "$repo_uri" || "$repo_uri" == "None" || -z "$config_api_url" || "$config_api_url" == "None" ]]; then
-     log_error "Missing CDK outputs (EcrRepositoryUri or ConfigApiUrl)."
-     log_info "Run ./run.sh infra-deploy first to provision ECR and Config API."
+  if [[ -z "$repo_uri" || "$repo_uri" == "None" ]]; then
+     log_error "Missing CDK output (EcrRepositoryUri)."
+     log_info "Run ./run.sh infra-deploy first to provision ECR."
      exit 1
   fi
 
@@ -183,21 +180,19 @@ cmd_eks_apply() {
   local k8s_dir="${APP_DIR}/deploy/eks"
   
   local repo_uri=$(get_cdk_output "EcrRepositoryUri")
-  local config_api_url=$(get_cdk_output "ConfigApiUrl")
   local irsa_role_arn=$(get_cdk_output "IrsaRoleArn")
   local cert_arn="${EKS_CERTIFICATE_ARN:-}"
   if [[ -z "$cert_arn" ]]; then
     cert_arn=$(get_cdk_output "CertificateArn")
   fi
   
-  if [[ -z "$repo_uri" || "$repo_uri" == "None" || -z "$config_api_url" || "$config_api_url" == "None" ]]; then
-     log_error "Missing CDK outputs (EcrRepositoryUri or ConfigApiUrl)."
-     log_info "Run ./run.sh infra-deploy first to provision ECR and Config API."
+  if [[ -z "$repo_uri" || "$repo_uri" == "None" ]]; then
+     log_error "Missing CDK output (EcrRepositoryUri)."
+     log_info "Run ./run.sh infra-deploy first to provision ECR."
      exit 1
   fi
 
   export ECR_REPO_URL="$repo_uri"
-  export CONFIG_API_URL="$config_api_url"
   export IRSA_ROLE_ARN="$irsa_role_arn"
   export AWS_REGION="${AWS_REGION:-$(aws configure get region || echo "us-east-1")}"
   export GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-}"
@@ -237,8 +232,7 @@ cmd_eks_apply() {
     sed -e "s|\${IRSA_ROLE_ARN}|${IRSA_ROLE_ARN}|g" \
         "${k8s_dir}/serviceaccount.yaml" | kubectl apply -n "${K8S_NAMESPACE}" -f -
   
-    sed -e "s|\${CONFIG_API_URL}|${CONFIG_API_URL}|g" \
-        -e "s|\${AWS_REGION}|${AWS_REGION}|g" \
+    sed -e "s|\${AWS_REGION}|${AWS_REGION}|g" \
         -e "s|\${GOOGLE_CLIENT_ID}|${GOOGLE_CLIENT_ID}|g" \
         -e "s|\${APPLICATION_ID}|${APPLICATION_ID}|g" \
         -e "s|\${EMAILMCP_LOG_LEVEL}|${EMAILMCP_LOG_LEVEL}|g" \
@@ -247,7 +241,6 @@ cmd_eks_apply() {
         "${k8s_dir}/configmap.yaml" | kubectl apply -n "${K8S_NAMESPACE}" -f -
 
     sed -e "s|\${GOOGLE_CLIENT_SECRET}|${GOOGLE_CLIENT_SECRET}|g" \
-        -e "s|\${EMAILMCP_JWT_SECRET}|${EMAILMCP_JWT_SECRET}|g" \
         "${k8s_dir}/secret.yaml" | kubectl apply -n "${K8S_NAMESPACE}" -f -
         
     sed -e "s|\${ECR_REPO_URL}|${ECR_REPO_URL}|g" \
@@ -531,7 +524,6 @@ ensure_eks_oidc_for_deploy() {
 
 cmd_infra_deploy() {
   log_info "Starting cloud deployment..."
-  cmd_package_lambda
 
   # Always attach IRSA OIDC context. Missing context synthesizes a stack
   # without the IRSA role and CloudFormation deletes it.
@@ -548,65 +540,11 @@ cmd_infra_destroy() {
 }
 
 cmd_synth() {
-  cmd_package_lambda
   local cdk_args=("$@")
   # Synth should match deploy; fail closed the same way.
   ensure_eks_oidc_for_deploy cdk_args
   log_info "Running cdk synth..."
   run_cdk synth ${cdk_args[@]+"${cdk_args[@]}"}
-}
-
-cmd_package_lambda() {
-  log_info "Packaging Python Lambda function..."
-  # Clean old dist
-  rm -rf "${LAMBDA_DIR}/dist"
-  mkdir -p "${LAMBDA_DIR}/dist"
-  
-  # Copy main.py
-  cp "${LAMBDA_DIR}/main.py" "${LAMBDA_DIR}/dist/"
-  
-  # Install Linux x86_64 deps for the Lambda runtime. Host pip (e.g. macOS arm64)
-  # produces Darwin binaries that fail on Lambda with "invalid ELF header".
-  local lambda_python_version="3.14"
-  local lambda_platform="manylinux2014_x86_64"
-
-  log_info "  - Installing Python dependencies for Lambda (${lambda_platform}, cp${lambda_python_version//./})..."
-
-  # Always target manylinux wheels. Host pip on macOS otherwise installs Darwin
-  # .so files that fail on Lambda with "invalid ELF header".
-  # --platform requires --only-binary=:all: (no sdist builds for foreign targets).
-  if ! python3 -m pip install \
-      -r "${LAMBDA_DIR}/requirements.txt" \
-      -t "${LAMBDA_DIR}/dist" \
-      --platform "${lambda_platform}" \
-      --implementation cp \
-      --python-version "${lambda_python_version}" \
-      --only-binary=:all: \
-      --upgrade \
-      --quiet; then
-    log_error "Failed to install manylinux wheels for Lambda."
-    log_info "If wheels are missing for python ${lambda_python_version}, try packaging via Docker:"
-    log_info "  docker run --rm --platform linux/amd64 -v \"\$(pwd)/${LAMBDA_DIR}:/var/task\" -w /var/task public.ecr.aws/lambda/python:${lambda_python_version} pip install -r requirements.txt -t dist"
-    exit 1
-  fi
-
-  # Ensure main.py is present after dependency install
-  cp "${LAMBDA_DIR}/main.py" "${LAMBDA_DIR}/dist/"
-
-  # Fail fast if a macOS-native extension slipped into the package
-  if find "${LAMBDA_DIR}/dist" \( -name '*darwin*' -o -name '*.dylib' \) 2>/dev/null | grep -q .; then
-    log_error "Lambda package contains macOS-native binaries."
-    find "${LAMBDA_DIR}/dist" \( -name '*darwin*' -o -name '*.dylib' \) 2>/dev/null || true
-    exit 1
-  fi
-
-  if ! find "${LAMBDA_DIR}/dist" -name '*.so' 2>/dev/null | grep -q .; then
-    log_warn "No .so extensions found in Lambda package (ok if pure-Python deps only)."
-  else
-    log_info "  - Sample native extension: $(find "${LAMBDA_DIR}/dist" -name '*.so' | head -1 | xargs file)"
-  fi
-  
-  log_success "Lambda packaged in ${LAMBDA_DIR}/dist"
 }
 
 # --- Build & Push Commands ---
@@ -666,7 +604,6 @@ cmd_clean() {
 
   # Remove common temp files
   rm -f *.out 2>/dev/null || true
-  rm -rf "${LAMBDA_DIR}/dist" 2>/dev/null || true
   rm -rf "${INFRA_DIR}/cdk.out" 2>/dev/null || true
 
   log_success "Clean complete"
@@ -718,9 +655,6 @@ main() {
       ;;
     check)
       cmd_check "$@"
-      ;;
-    package-lambda|package_lambda)
-      cmd_package_lambda "$@"
       ;;
     clean)
       cmd_clean "$@"

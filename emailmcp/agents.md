@@ -1,24 +1,24 @@
 # EmailMCP - AI Agent Guidelines
 
 ## Project Overview
-EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) email capabilities to AI agents via the Model Context Protocol using Streamable HTTP. Account configuration is stored remotely via the Config API (DynamoDB + Secrets Manager); there is no local database.
+EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) email capabilities to AI agents via the Model Context Protocol using Streamable HTTP. Account configuration is stored remotely in DynamoDB; there is no local database.
 
 ## Core Principles
-- Security first: Never log credentials or email bodies. Passwords live in AWS Secrets Manager and are fetched per-request via the Config API.
+- Security first: Never log credentials or email bodies. Passwords are stored as encrypted attributes in DynamoDB and are fetched per-request.
 - Concurrency matters: IMAP connection pooling and SMTP client management must be efficient and safe.
 - Keep it idiomatic: Write clean, simple Go. Prefer standard library solutions when reasonable.
 - MCP tools should be reliable and well-described — they become the agent's capabilities.
 
 ## Security Rules (Non-Negotiable)
 - Never log passwords, decrypted credentials, or sensitive email content.
-- Credentials are never persisted by the EmailMCP process; they are loaded from the Config API for the lifetime of a request/connection.
-- IMAP and SMTP passwords live in one Secrets Manager document; list APIs must never echo secrets.
+- Credentials are never persisted by the EmailMCP process; they are loaded from DynamoDB for the lifetime of a request/connection.
+- IMAP and SMTP passwords are stored in DynamoDB; list APIs must never echo secrets.
 - HTTP request/response logging redacts `Authorization`, `Cookie`, and `Proxy-Authorization`.
 - IMAP pools are keyed by `(OwnerUserID, accountID)` — always set `Account.OwnerUserID` from the authenticated subject; call `DropPool` on remove/credential change.
 - Reject private/link-local/metadata IMAP/SMTP hosts (`internal/netutil`); require TLS except for explicit localhost (loopback is still blocked by host validation).
 
 ## Architecture Overview
-- `internal/config` — Env config + Config API client (SigV4 + Google bearer token)
+- `internal/config` — Env config + DynamoDB store (AWS SDK)
 - `internal/netutil` — Outbound host validation (SSRF) and TLS policy helpers
 - `internal/imap` — IMAP connection pool and operations
 - `internal/smtp` — SMTP client management and sending logic
@@ -53,23 +53,23 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 - Attachments arrive base64-encoded in tool input; decode only when sending.
 
 ## Testing & Quality
-- Write tests for the Config API client and connection pool logic.
+- Write tests for the DynamoDB store and connection pool logic.
 - Use table-driven tests where appropriate.
 - Run `go test ./...` and `go vet ./...` before considering changes complete.
 - Ensure `go build ./...` succeeds.
 
 ## Project-Specific Patterns
 - One email account config per authenticated Google user (keyed by `sub`).
-- Account CRUD goes through `config.Client` (GET/PUT/DELETE Config API).
-- All IMAP/SMTP operations take a full `*types.Account` with plaintext passwords from the Config API.
-- HTTP MCP traffic requires the server's own session JWT (issued after Google sign-in). `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`, and `CONFIG_API_URL` are required at startup for HTTP mode; set `EMAILMCP_JWT_SECRET` for stable sessions (required on EKS via `deploy/eks/secret.yaml`). Google ID tokens are cryptographically verified (signature, aud, iss, exp) before minting session JWTs.
+- Account CRUD goes through `config.Store` (GET/PUT/DELETE DynamoDB).
+- All IMAP/SMTP operations take a full `*types.Account` with plaintext passwords from DynamoDB.
+- HTTP MCP traffic requires an opaque session access token (issued after Google sign-in) resolved against the session store. `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`, and `EMAILMCP_USER_CONFIG_TABLE` are required at startup for HTTP mode; `EMAILMCP_SESSION_TABLE` (or SSM `/emailmcp/session-table/name`) and `EMAILMCP_USER_CONFIG_TABLE` (or SSM `/emailmcp/user-config-table/name`) select the DynamoDB tables (in-memory fallback when unset). Google ID tokens are cryptographically verified (signature, aud, iss, exp) before a session is issued.
 - `OAUTH_REDIRECT_ALLOWLIST` (optional, ConfigMap): when non-empty, HTTPS OAuth redirect URIs must match the allowlist; when blank, the allowlist is not enforced. Loopback HTTP and custom schemes remain allowed for desktop MCP clients.
-- MCP OAuth lives in `internal/server/oauth.go`: protected-resource + AS metadata, DCR, authorize → Google, callback, token. After Google verifies the user, the token endpoint issues a short-lived JWT (1h, minted/verified via `internal/server/jwt.go`) as `access_token`, paired with a 7-day refresh token. The Google ID token is embedded in the JWT and forwarded downstream to the Config API (which still verifies a genuine Google token).
+- MCP OAuth lives in `internal/server/oauth.go`: protected-resource + AS metadata, DCR, authorize → Google, callback, token. After Google verifies the user, the token endpoint issues an opaque `access_token` (1h, capped by the Google ID token expiry) paired with an opaque refresh token, persisting the session in the `SessionStore` (`internal/server/store.go`). Sessions and registered DCR clients live in DynamoDB; short-lived auth codes and pending authorizations stay in-memory.
 - The main server uses Streamable HTTP (`mcp.NewStreamableHTTPHandler`).
 
 ## GoLand Specific
 - The project uses standard Go modules. GoLand should resolve dependencies cleanly.
-- Run configurations should set `CONFIG_API_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `PUBLIC_BASE_URL` for HTTP mode.
+- Run configurations should set `EMAILMCP_USER_CONFIG_TABLE`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `PUBLIC_BASE_URL` for HTTP mode.
 
 ## Common Pitfalls to Avoid
 - Logging plaintext passwords or serializing them into MCP responses.
@@ -79,4 +79,4 @@ EmailMCP is a secure MCP server that exposes IMAP (inbound) and SMTP (outbound) 
 - Forgetting to close or properly release connections on error paths.
 - Using sequence numbers instead of UIDs for operations across sessions.
 - Falling back to any local database or file for account storage.
-- Storing `smtp_password` in DynamoDB or accepting client-supplied `secretArn`.
+- Trusting a client-supplied user/owner identifier instead of the authenticated session subject when keying account items.

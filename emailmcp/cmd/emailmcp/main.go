@@ -43,23 +43,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Resolve CONFIG_API_URL from SSM when not set in the environment.
+	// Resolve DynamoDB table names from SSM when not set in the environment.
 	cfg.FetchRemoteDefaults(ctx)
-
-	if cfg.ConfigAPIURL == "" {
-		logger.Error("CONFIG_API_URL is required (set env or ensure SSM parameter /emailmcp/config-api/url is available)")
-		os.Exit(1)
-	}
-
-	logger.Info("config api configured; running startup health check", "url", cfg.ConfigAPIURL)
-	healthClient := config.NewClient(cfg.ConfigAPIURL, cfg.ApplicationID)
-	if err := healthClient.EnsureHealthy(ctx, logger); err != nil {
-		logger.Error("config api health check failed; refusing to start",
-			"error", err,
-			"url", cfg.ConfigAPIURL,
-		)
-		os.Exit(1)
-	}
 
 	srv, err := server.New(ctx, cfg)
 	if err != nil {

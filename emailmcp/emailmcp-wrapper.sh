@@ -30,12 +30,10 @@ if [[ -f "$CONFIG_FILE" ]]; then
   set +a
 fi
 
-# Ensure mandatory environment variables are set
-if [[ -z "${CONFIG_API_URL:-}" ]]; then
-  log_error "CONFIG_API_URL is not set."
-  log_info "Please check $CONFIG_FILE or set it in your environment."
-  exit 1
-fi
+# Ensure mandatory environment variables are set.
+# Per-user email account config is read/written directly from DynamoDB; the
+# table name is auto-resolved from SSM (or EMAILMCP_USER_CONFIG_TABLE) and is
+# therefore not required here.
 if [[ -z "${GOOGLE_CLIENT_ID:-}" ]]; then
   log_error "GOOGLE_CLIENT_ID is not set."
   log_info "Please check $CONFIG_FILE or set it in your environment."

@@ -2,13 +2,11 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as kms from 'aws-cdk-lib/aws-kms';
-import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cloudtrail from 'aws-cdk-lib/aws-cloudtrail';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
-import * as path from 'path';
 
 export class InfrastructureStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -17,11 +15,14 @@ export class InfrastructureStack extends cdk.Stack {
     // 1. KMS Key for encryption
     const kmsKey = new kms.Key(this, 'EmailMCPKey', {
       enableKeyRotation: true,
-      description: 'KMS key for EmailMCP DynamoDB and Secrets Manager',
+      description: 'KMS key for EmailMCP DynamoDB tables',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // 2. DynamoDB Table
+    // 2. DynamoDB Table (per-user email account configurations).
+    // The Go MCP server reads/writes this table directly via IRSA (the former
+    // Python Config API Lambda has been removed). IMAP/SMTP passwords are
+    // stored as attributes here, encrypted at rest with the shared KMS key.
     const table = new dynamodb.Table(this, 'EmailMCPUserConfigs', {
       partitionKey: { name: 'applicationId', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
@@ -32,50 +33,29 @@ export class InfrastructureStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // 3. Lambda Function for Config API
-    const googleClientId = this.node.tryGetContext('googleClientId');
-
-    const configApiLambda = new lambda.Function(this, 'EmailMCPConfigApi', {
-      runtime: new lambda.Runtime('python3.14', lambda.RuntimeFamily.PYTHON),
-      handler: 'main.handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, '../../emailmcp-config-api/dist')),
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 256,
-      environment: {
-        TABLE_NAME: table.tableName,
-        KMS_KEY_ARN: kmsKey.keyArn,
-        GOOGLE_CLIENT_ID: googleClientId || '',
-      },
+    // 2b. DynamoDB Session Table (EmailMCP OAuth sessions + registered clients)
+    // The Go MCP server persists opaque access/refresh token sessions and
+    // Dynamic Client Registrations here so they survive restarts and span
+    // replicas. Items are namespaced by the "pk" partition key; a GSI on
+    // "refreshToken" supports the refresh_token grant, and a "ttl" attribute
+    // expires stale sessions/clients automatically.
+    const sessionTable = new dynamodb.Table(this, 'EmailMCPSessions', {
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+      encryptionKey: kmsKey,
+      pointInTimeRecovery: true,
+      timeToLiveAttribute: 'ttl',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // 4. Permissions
-    table.grantReadWriteData(configApiLambda);
-    kmsKey.grantEncryptDecrypt(configApiLambda);
-    
-    // Grant permissions to Secrets Manager
-    configApiLambda.addToRolePolicy(new iam.PolicyStatement({
-      actions: [
-        'secretsmanager:CreateSecret',
-        'secretsmanager:GetSecretValue',
-        'secretsmanager:PutSecretValue',
-        'secretsmanager:DeleteSecret',
-        'secretsmanager:TagResource',
-        'secretsmanager:DescribeSecret',
-      ],
-      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:emailmcp/imap/*`],
-    }));
-
-    // 5. Lambda Function URL
-    const functionUrl = configApiLambda.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.AWS_IAM,
-      cors: {
-        allowedOrigins: ['*'],
-        allowedMethods: [lambda.HttpMethod.ALL],
-        allowedHeaders: ['Authorization', 'Content-Type', 'X-Google-ID-Token'],
-      },
+    sessionTable.addGlobalSecondaryIndex({
+      indexName: 'refresh-index',
+      partitionKey: { name: 'refreshToken', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
     });
 
-    // 6. IRSA Role for EKS (Preferred)
+    // 3. IRSA Role for EKS (Preferred)
     const eksOidcProvider = this.node.tryGetContext('eksOidcProvider');
     const eksOidcProviderArn = this.node.tryGetContext('eksOidcProviderArn');
 
@@ -105,54 +85,52 @@ export class InfrastructureStack extends cdk.Stack {
         ),
       });
 
-      // Identity-based permissions for Function URL invoke.
-      // Include both the bare function ARN and qualified ARN (name:*) — Function
-      // URL IAM auth has been observed to require the qualified form.
+      // Grant permission to read the SSM parameters (DynamoDB table names).
       irsaRole.addToPolicy(new iam.PolicyStatement({
-        actions: ['lambda:InvokeFunctionUrl', 'lambda:InvokeFunction'],
+        actions: ['ssm:GetParameter'],
         resources: [
-          configApiLambda.functionArn,
-          `${configApiLambda.functionArn}:*`,
+          `arn:aws:ssm:${this.region}:${this.account}:parameter/emailmcp/session-table/name`,
+          `arn:aws:ssm:${this.region}:${this.account}:parameter/emailmcp/user-config-table/name`,
         ],
       }));
 
-      // Resource-based permission on the function is required for Function URL
-      // AWS_IAM auth. grantInvokeUrl only adds an identity policy for IAM roles
-      // in the same account, which is not sufficient for Function URLs and
-      // results in 403 Forbidden at the URL auth layer.
-      configApiLambda.addPermission('AllowIRSAInvokeFunctionUrl', {
-        principal: irsaRole,
-        action: 'lambda:InvokeFunctionUrl',
-        functionUrlAuthType: lambda.FunctionUrlAuthType.AWS_IAM,
-      });
+      // The Go MCP server reads/writes OAuth sessions AND per-user email account
+      // configurations directly in DynamoDB (both encrypted with the shared KMS
+      // key) via IRSA. The former Config API Lambda has been removed.
+      sessionTable.grantReadWriteData(irsaRole);
+      table.grantReadWriteData(irsaRole);
+      kmsKey.grantEncryptDecrypt(irsaRole);
 
-      // Grant permission to read the SSM parameter
-      irsaRole.addToPolicy(new iam.PolicyStatement({
-        actions: ['ssm:GetParameter'],
-        resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/emailmcp/config-api/url`],
-      }));
-      
       new cdk.CfnOutput(this, 'IrsaRoleArn', {
         value: irsaRole.roleArn,
       });
     }
 
     // 8. Audit Logging (CloudTrail)
-    const trail = new cloudtrail.Trail(this, 'EmailMCPAuditTrail', {
+    new cloudtrail.Trail(this, 'EmailMCPAuditTrail', {
       managementEvents: cloudtrail.ReadWriteType.ALL,
     });
-    // Log data events for the Lambda
-    trail.addLambdaEventSelector([configApiLambda]);
 
-    new cdk.CfnOutput(this, 'ConfigApiUrl', {
-      value: functionUrl.url,
+    // 11. SSM Parameter for the user config table name (consumed by the Go MCP server)
+    new ssm.StringParameter(this, 'UserConfigTableNameParam', {
+      parameterName: '/emailmcp/user-config-table/name',
+      stringValue: table.tableName,
+      description: 'The DynamoDB table name for EmailMCP per-user email account configurations',
     });
 
-    // 11. SSM Parameter for the URL (Way to inform other services)
-    new ssm.StringParameter(this, 'ConfigApiUrlParam', {
-      parameterName: '/emailmcp/config-api/url',
-      stringValue: functionUrl.url,
-      description: 'The URL of the EmailMCP Config API Lambda',
+    new cdk.CfnOutput(this, 'UserConfigTableName', {
+      value: table.tableName,
+    });
+
+    // 11b. SSM Parameter for the session table name (consumed by the Go MCP server)
+    new ssm.StringParameter(this, 'SessionTableNameParam', {
+      parameterName: '/emailmcp/session-table/name',
+      stringValue: sessionTable.tableName,
+      description: 'The DynamoDB table name for EmailMCP OAuth sessions',
+    });
+
+    new cdk.CfnOutput(this, 'SessionTableName', {
+      value: sessionTable.tableName,
     });
 
     // 9. ECR Repository for the Go MCP Server

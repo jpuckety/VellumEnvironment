@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -14,11 +15,7 @@ import (
 
 func testOAuthServer(t *testing.T) *OAuthServer {
 	t.Helper()
-	tokens, err := NewTokenIssuer([]byte("test-signing-secret"), "https://emailmcp.ecg.co", accessTokenTTL)
-	if err != nil {
-		t.Fatalf("NewTokenIssuer: %v", err)
-	}
-	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", tokens, nil, nil)
+	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", newMemorySessionStore(), nil, nil)
 	if err != nil {
 		t.Fatalf("NewOAuthServer: %v", err)
 	}
@@ -27,11 +24,7 @@ func testOAuthServer(t *testing.T) *OAuthServer {
 
 func testOAuthServerWithAllowlist(t *testing.T, allowlist []string) *OAuthServer {
 	t.Helper()
-	tokens, err := NewTokenIssuer([]byte("test-signing-secret"), "https://emailmcp.ecg.co", accessTokenTTL)
-	if err != nil {
-		t.Fatalf("NewTokenIssuer: %v", err)
-	}
-	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", tokens, nil, allowlist)
+	o, err := NewOAuthServer("https://emailmcp.ecg.co", "client-id.apps.googleusercontent.com", "client-secret", newMemorySessionStore(), nil, allowlist)
 	if err != nil {
 		t.Fatalf("NewOAuthServer: %v", err)
 	}
@@ -88,7 +81,7 @@ func TestAuthServerMetadata(t *testing.T) {
 	if meta["registration_endpoint"] != "https://emailmcp.ecg.co/oauth/register" {
 		t.Errorf("registration_endpoint = %v", meta["registration_endpoint"])
 	}
-	// HS256 session tokens have no public JWKS; do not advertise Google's certs.
+	// Opaque access tokens have no public JWKS; do not advertise Google's certs.
 	if _, ok := meta["jwks_uri"]; ok {
 		t.Errorf("jwks_uri should be omitted, got %v", meta["jwks_uri"])
 	}
@@ -123,11 +116,8 @@ func TestDynamicClientRegistration(t *testing.T) {
 	if resp["token_endpoint_auth_method"] != "none" {
 		t.Errorf("token_endpoint_auth_method = %v, want none", resp["token_endpoint_auth_method"])
 	}
-	o.mu.Lock()
-	_, ok := o.clients[clientID]
-	o.mu.Unlock()
-	if !ok {
-		t.Fatal("client not stored")
+	if _, err := o.store.GetClient(context.Background(), clientID); err != nil {
+		t.Fatalf("client not stored: %v", err)
 	}
 }
 

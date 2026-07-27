@@ -6,13 +6,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type contextKey string
 
 const (
-	userContextKey  contextKey = "user"
-	tokenContextKey contextKey = "token"
+	userContextKey contextKey = "user"
 )
 
 type UserInfo struct {
@@ -21,14 +21,15 @@ type UserInfo struct {
 }
 
 type Authenticator struct {
-	tokens              *TokenIssuer
+	store               SessionStore
 	publicBaseURL       string
 	resourceMetadataURL string
 }
 
-// NewAuthenticator builds the resource-server middleware that verifies the
-// server's own session JWTs (issued after Google sign-in) using tokens.
-func NewAuthenticator(tokens *TokenIssuer, publicBaseURL string) *Authenticator {
+// NewAuthenticator builds the resource-server middleware that authenticates MCP
+// requests by resolving the opaque bearer access token against the session
+// store (populated after Google sign-in).
+func NewAuthenticator(store SessionStore, publicBaseURL string) *Authenticator {
 	base := strings.TrimRight(publicBaseURL, "/")
 	resourceMeta := ""
 	if base != "" {
@@ -36,7 +37,7 @@ func NewAuthenticator(tokens *TokenIssuer, publicBaseURL string) *Authenticator 
 	}
 
 	return &Authenticator{
-		tokens:              tokens,
+		store:               store,
 		publicBaseURL:       base,
 		resourceMetadataURL: resourceMeta,
 	}
@@ -108,28 +109,24 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		}
 
 		token := parts[1]
-		claims, err := a.tokens.Verify(token)
+		sess, err := a.store.GetSessionByAccessToken(r.Context(), token)
 		if err != nil {
-			// Log details server-side only; never echo verification errors to clients.
-			slog.Warn("session jwt verification failed", "error", err, "remote", r.RemoteAddr)
+			// Log details server-side only; never echo lookup errors to clients.
+			slog.Warn("session lookup failed", "error", err, "remote", r.RemoteAddr)
 			a.writeUnauthorized(w, r, "Unauthorized: Invalid token")
+			return
+		}
+		if time.Now().After(sess.AccessExpiresAt) {
+			a.writeUnauthorized(w, r, "Unauthorized: Session expired")
 			return
 		}
 
 		userInfo := &UserInfo{
-			Subject: claims.Subject,
-			Email:   claims.Email,
+			Subject: sess.Subject,
+			Email:   sess.Email,
 		}
 
 		ctx := context.WithValue(r.Context(), userContextKey, userInfo)
-		// Forward the embedded Google ID token downstream: the Config API expects a
-		// genuine Google token, not our session JWT. Fall back to the raw bearer
-		// token if none was embedded.
-		downstreamToken := claims.GoogleIDToken
-		if downstreamToken == "" {
-			downstreamToken = token
-		}
-		ctx = context.WithValue(ctx, tokenContextKey, downstreamToken)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -137,9 +134,4 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 func UserFromContext(ctx context.Context) (*UserInfo, bool) {
 	u, ok := ctx.Value(userContextKey).(*UserInfo)
 	return u, ok
-}
-
-func TokenFromContext(ctx context.Context) (string, bool) {
-	t, ok := ctx.Value(tokenContextKey).(string)
-	return t, ok
 }
