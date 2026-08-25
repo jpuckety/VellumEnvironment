@@ -16,7 +16,7 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 - **Google OAuth2 Authentication**: MCP OAuth 2.1 discovery + authorization-code flow that fronts Google sign-in; Google ID tokens authorize MCP traffic.
 - **Remote Storage**: Account configuration and encrypted credentials in Amazon DynamoDB.
 - **AWS CDK Infrastructure**: Fully automated resource provisioning using TypeScript.
-- **Direct DynamoDB Storage**: The Go server reads/writes configuration directly to DynamoDB via IRSA.
+- **Direct DynamoDB Storage**: The Go server reads/writes configuration directly to DynamoDB via the ECS task role.
 
 ### SMTP (Outbound)
 - Send plain text + HTML emails
@@ -36,20 +36,15 @@ A production-grade **Model Context Protocol (MCP)** server written in Go that ex
 - Google OAuth2 Client ID
 - DynamoDB Table Name (auto-resolvable via SSM)
 
-## Quick Start (Cloud Deployment)
+## Cloud deployment
 
-The cloud deployment provisions a multi-user environment using AWS CDK.
+AWS deploy is owned by [MCPCICD](https://github.com/jpuckety/MCPCICD). This repo
+supplies the env stack (`cdk/`) and the repo-root `Dockerfile`. Local helpers:
 
 ```bash
-# 1. Setup environment
-./run.sh setup
-
-# 2. Deploy to AWS
-# Replace YOUR_GOOGLE_CLIENT_ID with your real Google OAuth2 Client ID
-./run.sh deploy cloud dev --context googleClientId=YOUR_GOOGLE_CLIENT_ID
+./run.sh test
+./run.sh synth
 ```
-
-The `run.sh` script automates building the Go binary and deploying the CDK stack. After deployment, note the `UserConfigTableName` output for your MCP server configuration.
 
 ## Local Quick Start
 
@@ -101,19 +96,9 @@ When deploying to AWS, the following environment variables can be set in `emailm
 - `AWS_REGION`: The AWS region to deploy the infrastructure to (defaults to your AWS CLI configuration).
 - `GOOGLE_CLIENT_ID`: Your Google OAuth2 Client ID for user authentication.
 - `GOOGLE_CLIENT_SECRET`: Google OAuth client secret (HTTP/MCP OAuth flow).
-- `PUBLIC_BASE_URL`: Public origin of the MCP server (default for EKS: `https://emailmcp.ecg.co`).
-- `EKS_OIDC_PROVIDER_ARN`: (EKS Mode) The ARN of your cluster's IAM OIDC provider. If not set, the script will attempt to detect it from the current kubectl context.
-- `EKS_CERTIFICATE_ARN`: (EKS Mode) The ARN of the SSL certificate for the ALB Ingress. If not set, the script will attempt to retrieve it from the CDK outputs.
+- `PUBLIC_BASE_URL`: Public origin of the MCP server (ECS: `https://email.mcp.ecg.co` in Prod).
 
-Example:
-```bash
-EKS_OIDC_PROVIDER_ARN=arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLEDATA ./run.sh eks-deploy
-```
-
-To remove the deployment from EKS:
-```bash
-./run.sh undeploy-eks
-```
+Cloud deploy and teardown are handled by MCPCICD, not this `run.sh`.
 
 ## MCP Tools
 

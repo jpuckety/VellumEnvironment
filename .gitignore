@@ -16,5 +16,9 @@ emailmcp.db*
 emailmcp-config-api/dist/
 .output.txt
 
+# CDK / Node
+node_modules/
+cdk.out/
+
 # Agent
 .junie/

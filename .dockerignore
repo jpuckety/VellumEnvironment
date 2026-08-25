@@ -1,0 +1,12 @@
+cdk/cdk.out/
+cdk/node_modules/
+cdk/*.js
+cdk/*.d.ts
+node_modules/
+.git/
+.idea/
+*.iml
+.DS_Store
+*.log
+emailmcp/.env
+.env

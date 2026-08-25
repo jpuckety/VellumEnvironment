@@ -1,13 +1,55 @@
-# Vellum Environment
+# email-mcp
 
-This repository contains a group of projects focused on the Vellum environment.
+A production-ready **MCP (Model Context Protocol)** server written in **Go** that
+exposes IMAP and SMTP email capabilities to MCP clients. It is simultaneously:
 
-## Sub-Projects
+- an **OAuth 2.1 Authorization Server** fronting **Google OIDC**,
+- a **Resource Server** guarding MCP tool calls with opaque bearer tokens, and
+- an MCP server exposing email tools.
 
-### [EmailMCP](./emailmcp)
-A Model Context Protocol (MCP) server that exposes email capabilities (IMAP + SMTP) to AI agents.
+Storage is **DynamoDB** (durable, default) or **in-memory** (fallback). IMAP/SMTP
+credentials live as attributes on the user-config table, encrypted at rest with a
+customer-managed KMS key.
 
-## Repository Structure
+AWS deploy, image promotion, and SSM secrets are owned by
+[MCPCICD](https://github.com/jpuckety/MCPCICD). This repo is the application plus
+the env CloudFormation stack (`EmailMcpStack`) that MCPCICD deploys into Dev/Prod.
 
-- `emailmcp/`: Core EmailMCP server and tools.
-- `go.work`: Go workspace configuration for managing multiple modules.
+## Layout
+
+| Path | Role |
+|---|---|
+| `emailmcp/` | Go MCP server |
+| `cdk/` | Env stack: VPC, ALB, ECS CodeDeploy blue/green, DynamoDB, WAF |
+| `Dockerfile` | Repo-root image built by MCPCICD (`linux/amd64`) |
+
+## Local development
+
+```bash
+./run.sh help
+./run.sh test
+./run.sh run
+./run.sh docker-build
+./run.sh synth
+```
+
+Copy [emailmcp/.env.example](emailmcp/.env.example) to `emailmcp/.env` for local
+HTTP mode (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_BASE_URL`).
+
+PRs run GitHub Actions only (`go test ./...` + `docker build`). Merges to
+`master` are released by the MCPCICD pipeline named `email-mcp`.
+
+## Pipeline contract
+
+MCPCICD expects:
+
+- Repo-root `Dockerfile`
+- `cdk/lib/email-mcp-stack.ts` with `DeploymentControllerType.CODE_DEPLOY` and
+  `TASK_FAMILY = 'email-mcp'`
+- `cdk/scripts/prepare-taskdef.js`
+- Container `email-mcp` on port `8080` with `GET /health`
+- SSM SecureString parameters in each env account:
+  - `/email-mcp/google-client-id`
+  - `/email-mcp/google-client-secret`
+
+Hostnames (MCPCICD context): `email-dev.mcp.ecg.co` (Dev) and `email.mcp.ecg.co` (Prod).

@@ -26,7 +26,7 @@ var ErrConfigNotFound = errors.New("config not found")
 // Store persists per-user email account configurations. It replaces the former
 // HTTP Config API Lambda: the Go MCP server now reads and writes the
 // EmailMCPUserConfigs DynamoDB table directly (encrypted at rest with the
-// shared KMS key) via IRSA, including IMAP/SMTP credentials. Access is already
+// shared KMS key) via the ECS task role, including IMAP/SMTP credentials. Access is already
 // authenticated upstream, so callers pass the authenticated user's Google
 // subject as userID.
 type Store interface {

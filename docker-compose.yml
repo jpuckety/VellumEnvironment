@@ -1,7 +1,7 @@
 services:
   emailmcp:
     build:
-      context: emailmcp
+      context: .
       dockerfile: Dockerfile
     container_name: emailmcp
     restart: always
@@ -10,14 +10,3 @@ services:
       - EMAILMCP_LISTEN_ADDR=:8080
     ports:
       - "8080:8080"
-
-  vellum-assistant:
-    image: vellumai/vellum-assistant:latest
-    container_name: vellum-assistant
-    restart: always
-    environment:
-      - PORT=8000
-    ports:
-      - "8000:8000"
-    depends_on:
-      - emailmcp

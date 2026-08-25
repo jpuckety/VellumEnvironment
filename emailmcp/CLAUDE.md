@@ -19,16 +19,16 @@ go vet ./...                           # vet
 go build ./...                         # verify everything compiles
 
 # From repo root via run.sh
-./run.sh setup         # copy .env.example → .env
-./run.sh build-push    # build and push Docker image to ECR
-./run.sh run           # load .env and start the server
-./run.sh run --transport stdio  # run in stdio MCP mode
+./run.sh test          # go test ./...
+./run.sh run           # load .env and start the HTTP server
+./run.sh run-stdio     # stdio MCP mode
 ./run.sh check         # test + vet + build
-./run.sh install       # install binary + wrapper to /usr/local/bin
-./run.sh clean         # remove binaries and build artifacts
+./run.sh docker-build  # repo-root Dockerfile
+./run.sh synth         # CDK synth
+./run.sh clean         # remove binaries
 ```
 
-The server requires `EMAILMCP_USER_CONFIG_TABLE` and `GOOGLE_CLIENT_ID` to start. HTTP mode also requires `GOOGLE_CLIENT_SECRET` and `PUBLIC_BASE_URL` for the MCP OAuth authorization-code proxy to Google. The `run.sh` script loads them from `emailmcp/.env` automatically. If `EMAILMCP_USER_CONFIG_TABLE` is unset, startup may resolve it from SSM parameter `/emailmcp/user-config-table/name` when `AWS_REGION` and credentials are available.
+The server requires `GOOGLE_CLIENT_ID` to start. HTTP mode also requires `GOOGLE_CLIENT_SECRET` and `PUBLIC_BASE_URL`. The `run.sh` script loads them from `emailmcp/.env` automatically. If `EMAILMCP_USER_CONFIG_TABLE` is unset, startup may resolve it from SSM parameter `/emailmcp/user-config-table/name` when `AWS_REGION` and credentials are available. ECS injects table names as environment variables.
 
 ## Architecture
 
