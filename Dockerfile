@@ -1,9 +1,11 @@
 # syntax=docker/dockerfile:1
 
+# Official images via Google's Docker Hub mirror. Anonymous Hub and ECR Public
+# pulls 429 under CodeBuild/BuildKit metadata lookups.
 # ============================================================================
 # Frontend stage: build the Angular web application
 # ============================================================================
-FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/node:22-alpine AS frontend-builder
 WORKDIR /web
 
 COPY web/package*.json ./
@@ -15,7 +17,7 @@ RUN npm run build
 # ============================================================================
 # Build stage: compile a static Go binary from emailmcp/.
 # ============================================================================
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.25-alpine AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 
@@ -33,7 +35,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o
 # ============================================================================
 # Runtime stage: non-root Alpine image matching ECS volume-init uid 10001.
 # ============================================================================
-FROM alpine:3.21
+FROM mirror.gcr.io/library/alpine:3.21
 WORKDIR /app
 
 RUN apk add --no-cache ca-certificates tzdata wget \
