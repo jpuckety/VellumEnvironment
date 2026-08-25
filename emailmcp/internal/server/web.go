@@ -144,7 +144,7 @@ func (s *Server) handleWebLogin(w http.ResponseWriter, r *http.Request) {
 	s.oauth.mu.Lock()
 	s.oauth.cleanupLocked()
 	s.oauth.pending[state] = &pendingAuth{
-		ClientID:    "web-ui",
+		ClientID:    webUIClientID,
 		RedirectURI: s.cfg.PublicBaseURL + "/auth/callback",
 		ClientState: "web",
 		ExpiresAt:   time.Now().Add(oauthPendingTTL),
@@ -190,7 +190,7 @@ func (s *Server) handleWebCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	tok, err := s.oauth.googleConfig.Exchange(ctx, code)
+	tok, err := s.oauth.exchangeCode(ctx, code)
 	if err != nil {
 		s.logger.Error("web login google token exchange failed", "error", err)
 		http.Redirect(w, r, "/portal/login?error=exchange_failed", http.StatusFound)
@@ -203,57 +203,14 @@ func (s *Server) handleWebCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subject, email, gExpiry, err := verifyGoogleIDToken(ctx, idToken, s.oauth.googleConfig.ClientID)
+	subject, email, gExpiry, err := s.oauth.verifyIDToken(ctx, idToken, s.oauth.googleConfig.ClientID)
 	if err != nil {
 		s.logger.Error("web login id token verification failed", "error", err)
 		http.Redirect(w, r, "/portal/login?error=invalid_token", http.StatusFound)
 		return
 	}
 
-	accessToken, err := randomToken(32)
-	if err != nil {
-		http.Redirect(w, r, "/portal/login?error=internal_error", http.StatusFound)
-		return
-	}
-	refreshToken, err := randomToken(32)
-	if err != nil {
-		http.Redirect(w, r, "/portal/login?error=internal_error", http.StatusFound)
-		return
-	}
-
-	accessExpiry := accessTokenExpiry(gExpiry)
-	sess := &Session{
-		AccessToken:      accessToken,
-		RefreshToken:     refreshToken,
-		ClientID:         "web-ui",
-		Subject:          subject,
-		Email:            email,
-		GoogleIDToken:    idToken,
-		GoogleRefresh:    tok.RefreshToken,
-		AccessExpiresAt:  accessExpiry,
-		RefreshExpiresAt: time.Now().Add(refreshTokenTTL),
-	}
-
-	if err := s.authenticator.store.PutSession(ctx, sess); err != nil {
-		s.logger.Error("web login failed to persist session", "error", err)
-		http.Redirect(w, r, "/portal/login?error=session_store_failed", http.StatusFound)
-		return
-	}
-
-	// Set HttpOnly session cookie
-	isSecure := strings.HasPrefix(s.cfg.PublicBaseURL, "https://")
-	http.SetCookie(w, &http.Cookie{
-		Name:     "emailmcp_session",
-		Value:    accessToken,
-		Path:     "/",
-		Expires:  accessExpiry,
-		HttpOnly: true,
-		Secure:   isSecure,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	// Redirect to portal with token parameter so the SPA can store it
-	http.Redirect(w, r, "/portal/?token="+accessToken, http.StatusFound)
+	s.oauth.completeWebLogin(w, r, subject, email, idToken, tok.RefreshToken, gExpiry)
 }
 
 // GET /api/me - returns current authenticated user information

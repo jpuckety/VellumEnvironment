@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/config"
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
+	"golang.org/x/oauth2"
 )
 
 func newTestWebServerWithSession(t *testing.T) (*Server, string) {
@@ -149,6 +152,95 @@ func TestWebCallback_Redirects(t *testing.T) {
 	locMissing := respMissing.Header.Get("Location")
 	if locMissing != "/portal/login?error=missing_code_or_state" {
 		t.Errorf("Location = %q, want /portal/login?error=missing_code_or_state", locMissing)
+	}
+}
+
+func TestWebLogin_GoogleCallbackIssuesPortalSession(t *testing.T) {
+	srv, _ := newTestWebServerWithSession(t)
+	srv.oauth.exchangeFn = func(_ context.Context, code string) (*oauth2.Token, error) {
+		if code != "google-code" {
+			t.Fatalf("unexpected google code %q", code)
+		}
+		tok := &oauth2.Token{
+			AccessToken:  "g-access",
+			RefreshToken: "g-refresh",
+			Expiry:       time.Now().Add(time.Hour),
+		}
+		return tok.WithExtra(map[string]any{"id_token": "fake-id-token"}), nil
+	}
+	srv.oauth.verifyFn = func(_ context.Context, rawToken, audience string) (string, string, time.Time, error) {
+		if rawToken != "fake-id-token" {
+			return "", "", time.Time{}, errors.New("bad test token")
+		}
+		if audience != "test-client-id" {
+			t.Fatalf("audience = %q", audience)
+		}
+		return "sub-1", "user@example.com", time.Now().Add(time.Hour), nil
+	}
+
+	ts := httptest.NewServer(srv.HTTPHandler())
+	defer ts.Close()
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	loginResp, err := client.Get(ts.URL + "/auth/login")
+	if err != nil {
+		t.Fatalf("GET /auth/login: %v", err)
+	}
+	loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusFound {
+		t.Fatalf("/auth/login status = %d", loginResp.StatusCode)
+	}
+	googleURL, err := url.Parse(loginResp.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("parse google location: %v", err)
+	}
+	if googleURL.Query().Get("redirect_uri") != "https://emailmcp.ecg.co/oauth/callback" {
+		t.Fatalf("redirect_uri = %q", googleURL.Query().Get("redirect_uri"))
+	}
+	state := googleURL.Query().Get("state")
+	if state == "" {
+		t.Fatal("missing google state")
+	}
+
+	cbResp, err := client.Get(ts.URL + "/oauth/callback?code=google-code&state=" + url.QueryEscape(state))
+	if err != nil {
+		t.Fatalf("GET /oauth/callback: %v", err)
+	}
+	cbResp.Body.Close()
+	if cbResp.StatusCode != http.StatusFound {
+		t.Fatalf("/oauth/callback status = %d body=%s", cbResp.StatusCode, "")
+	}
+	loc := cbResp.Header.Get("Location")
+	portalURL, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse portal location %q: %v", loc, err)
+	}
+	if portalURL.Path != "/portal/" && portalURL.Path != "/portal" {
+		t.Fatalf("Location = %q, want /portal/?token=...", loc)
+	}
+	token := portalURL.Query().Get("token")
+	if token == "" {
+		t.Fatalf("Location = %q, missing token", loc)
+	}
+	var sessionCookie string
+	for _, c := range cbResp.Cookies() {
+		if c.Name == "emailmcp_session" {
+			sessionCookie = c.Value
+		}
+	}
+	if sessionCookie != token {
+		t.Fatalf("session cookie = %q, token = %q", sessionCookie, token)
+	}
+	sess, err := srv.authenticator.store.GetSessionByAccessToken(context.Background(), token)
+	if err != nil {
+		t.Fatalf("session not stored: %v", err)
+	}
+	if sess.ClientID != webUIClientID || sess.Subject != "sub-1" || sess.Email != "user@example.com" {
+		t.Fatalf("session = %+v", sess)
 	}
 }
 

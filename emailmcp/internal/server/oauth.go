@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -31,6 +32,9 @@ const (
 	// refreshTokenTTL is the lifetime of the opaque refresh token paired with
 	// the access token for longer-lived access.
 	refreshTokenTTL = 30 * 24 * time.Hour
+
+	// webUIClientID is the synthetic client used by the portal Google login.
+	webUIClientID = "web-ui"
 )
 
 // OAuthServer is a thin OAuth 2.1 authorization server that fronts Google
@@ -56,6 +60,10 @@ type OAuthServer struct {
 	pending   map[string]*pendingAuth // google state -> pending
 	codes     map[string]*issuedCode  // auth code -> issued
 	cleanupAt time.Time
+
+	// Optional test hooks. Production leaves these nil.
+	exchangeFn func(ctx context.Context, code string) (*oauth2.Token, error)
+	verifyFn   func(ctx context.Context, rawToken, audience string) (subject, email string, expiry time.Time, err error)
 }
 
 type pendingAuth struct {
@@ -319,6 +327,63 @@ func (o *OAuthServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
+func (o *OAuthServer) completeWebLogin(w http.ResponseWriter, r *http.Request, subject, email, idToken, googleRefresh string, gExpiry time.Time) {
+	accessToken, err := randomToken(32)
+	if err != nil {
+		http.Redirect(w, r, "/portal/login?error=internal_error", http.StatusFound)
+		return
+	}
+	refreshToken, err := randomToken(32)
+	if err != nil {
+		http.Redirect(w, r, "/portal/login?error=internal_error", http.StatusFound)
+		return
+	}
+
+	accessExpiry := accessTokenExpiry(gExpiry)
+	sess := &Session{
+		AccessToken:      accessToken,
+		RefreshToken:     refreshToken,
+		ClientID:         webUIClientID,
+		Subject:          subject,
+		Email:            email,
+		GoogleIDToken:    idToken,
+		GoogleRefresh:    googleRefresh,
+		AccessExpiresAt:  accessExpiry,
+		RefreshExpiresAt: time.Now().Add(refreshTokenTTL),
+	}
+	if err := o.store.PutSession(r.Context(), sess); err != nil {
+		o.logger.Error("web login failed to persist session", "error", err)
+		http.Redirect(w, r, "/portal/login?error=session_store_failed", http.StatusFound)
+		return
+	}
+
+	isSecure := strings.HasPrefix(o.baseURL, "https://")
+	http.SetCookie(w, &http.Cookie{
+		Name:     "emailmcp_session",
+		Value:    accessToken,
+		Path:     "/",
+		Expires:  accessExpiry,
+		HttpOnly: true,
+		Secure:   isSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/portal/?token="+url.QueryEscape(accessToken), http.StatusFound)
+}
+
+func (o *OAuthServer) exchangeCode(ctx context.Context, code string) (*oauth2.Token, error) {
+	if o.exchangeFn != nil {
+		return o.exchangeFn(ctx, code)
+	}
+	return o.googleConfig.Exchange(ctx, code)
+}
+
+func (o *OAuthServer) verifyIDToken(ctx context.Context, rawToken, audience string) (string, string, time.Time, error) {
+	if o.verifyFn != nil {
+		return o.verifyFn(ctx, rawToken, audience)
+	}
+	return verifyGoogleIDToken(ctx, rawToken, audience)
+}
+
 func (o *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if errParam := q.Get("error"); errParam != "" {
@@ -344,7 +409,7 @@ func (o *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	tok, err := o.googleConfig.Exchange(ctx, code)
+	tok, err := o.exchangeCode(ctx, code)
 	if err != nil {
 		o.logger.Error("google token exchange failed", "error", err)
 		http.Error(w, "failed to exchange code with Google", http.StatusBadGateway)
@@ -357,9 +422,18 @@ func (o *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cryptographically verify the Google ID token (signature, aud, iss, exp).
-	if _, _, _, err := verifyGoogleIDToken(ctx, idToken, o.googleConfig.ClientID); err != nil {
+	subject, email, gExpiry, err := o.verifyIDToken(ctx, idToken, o.googleConfig.ClientID)
+	if err != nil {
 		o.logger.Error("google id token verification failed after code exchange", "error", err)
 		http.Error(w, "failed to verify Google identity token", http.StatusBadGateway)
+		return
+	}
+
+	// Portal login reuses this Google callback (redirect_uri=/oauth/callback).
+	// Completing the web session here avoids a second hop to /auth/callback
+	// with state rewritten to "web", which the portal treats as expired_state.
+	if pending.ClientID == webUIClientID {
+		o.completeWebLogin(w, r, subject, email, idToken, tok.RefreshToken, gExpiry)
 		return
 	}
 
