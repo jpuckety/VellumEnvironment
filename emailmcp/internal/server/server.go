@@ -139,6 +139,9 @@ func (s *Server) HTTPHandler() http.Handler {
 		s.oauth.Mount(mux)
 	}
 
+	// Web authentication and account management REST API.
+	s.mountWebRoutes(mux)
+
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
 		return s.mcpServer
 	}, &mcp.StreamableHTTPOptions{
@@ -159,10 +162,10 @@ func (s *Server) HTTPHandler() http.Handler {
 	})
 
 	// MCP handler requires Google ID token authentication.
-	handler := s.authenticator.Middleware(mcpHandler)
+	mcpAuthHandler := s.authenticator.Middleware(mcpHandler)
 
-	// Register the MCP handler at the root.
-	mux.Handle("/", handler)
+	// Register root handler for MCP requests.
+	mux.Handle("/", mcpAuthHandler)
 
 	// Wrap everything in logging.
 	return httpLogging(s.logger, mux)

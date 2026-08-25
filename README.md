@@ -19,9 +19,10 @@ the env CloudFormation stack (`EmailMcpStack`) that MCPCICD deploys into Dev/Pro
 
 | Path | Role |
 |---|---|
-| `emailmcp/` | Go MCP server |
+| `emailmcp/` | Go MCP server & embedded static UI |
+| `web/` | Angular frontend for email account management |
 | `cdk/` | Env stack: VPC, ALB, ECS CodeDeploy blue/green, DynamoDB, WAF |
-| `Dockerfile` | Repo-root image built by MCPCICD (`linux/amd64`) |
+| `Dockerfile` | Multi-stage image build (Angular + Go static binary) |
 
 ## Local development
 

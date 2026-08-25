@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -92,6 +93,48 @@ func htmlEscape(s string) string {
 		`"`, "&quot;",
 	)
 	return replacer.Replace(s)
+}
+
+func (a *Authenticator) ExtractToken(r *http.Request) string {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		parts := strings.Split(authHeader, " ")
+		if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
+			return parts[1]
+		}
+	}
+
+	if cookie, err := r.Cookie("emailmcp_session"); err == nil && cookie.Value != "" {
+		return cookie.Value
+	}
+
+	if qToken := r.URL.Query().Get("token"); qToken != "" {
+		return qToken
+	}
+
+	return ""
+}
+
+// Authenticate resolves the user from Bearer header or session cookie.
+func (a *Authenticator) Authenticate(r *http.Request) (*UserInfo, error) {
+	token := a.ExtractToken(r)
+	if token == "" {
+		return nil, errors.New("Missing Authorization header")
+	}
+
+	sess, err := a.store.GetSessionByAccessToken(r.Context(), token)
+	if err != nil {
+		slog.Warn("session lookup failed", "error", err, "remote", r.RemoteAddr)
+		return nil, errors.New("Invalid token")
+	}
+	if time.Now().After(sess.AccessExpiresAt) {
+		return nil, errors.New("Session expired")
+	}
+
+	return &UserInfo{
+		Subject: sess.Subject,
+		Email:   sess.Email,
+	}, nil
 }
 
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {

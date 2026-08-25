@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}"
 APP_DIR="${PROJECT_ROOT}/emailmcp"
+WEB_DIR="${PROJECT_ROOT}/web"
 CDK_DIR="${PROJECT_ROOT}/cdk"
 ENV_FILE="${ENV_FILE:-${APP_DIR}/.env}"
 IMAGE_NAME="${IMAGE_NAME:-email-mcp:latest}"
@@ -67,6 +68,7 @@ TEST_ISOLATED_VARS=(
 
 cmd_test() {
   require go
+  cmd_build_web
   (
     cd "${APP_DIR}"
     local var
@@ -81,7 +83,18 @@ cmd_vet() {
   go_in_app vet ./... "$@"
 }
 
+cmd_build_web() {
+  if command -v npm >/dev/null 2>&1 && [[ -d "${WEB_DIR}" ]]; then
+    log "Building Angular frontend in ${WEB_DIR}..."
+    ( cd "${WEB_DIR}" && [[ -d node_modules ]] || npm install --no-audit --no-fund )
+    ( cd "${WEB_DIR}" && npm run build )
+  else
+    log "Skipping web build (npm not available or web/ missing)."
+  fi
+}
+
 cmd_build() {
+  cmd_build_web
   go_in_app build -o emailmcp ./cmd/emailmcp "$@"
 }
 
@@ -183,6 +196,7 @@ main() {
     test)                          cmd_test "$@" ;;
     vet)                           cmd_vet "$@" ;;
     build)                         cmd_build "$@" ;;
+    build-web|build_web)           cmd_build_web "$@" ;;
     check)                         cmd_check "$@" ;;
     clean)                         cmd_clean "$@" ;;
     run|run-http|run_http)         cmd_run "$@" ;;

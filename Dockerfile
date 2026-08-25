@@ -1,6 +1,18 @@
 # syntax=docker/dockerfile:1
 
 # ============================================================================
+# Frontend stage: build the Angular web application
+# ============================================================================
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
+WORKDIR /web
+
+COPY web/package*.json ./
+RUN npm ci
+
+COPY web/ ./
+RUN npm run build
+
+# ============================================================================
 # Build stage: compile a static Go binary from emailmcp/.
 # ============================================================================
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
@@ -15,6 +27,7 @@ COPY emailmcp/go.mod emailmcp/go.sum ./
 RUN go mod download
 
 COPY emailmcp/ ./
+COPY --from=frontend-builder /emailmcp/internal/server/dist ./internal/server/dist
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /emailmcp ./cmd/emailmcp
 
 # ============================================================================
