@@ -1,7 +1,8 @@
-import { Component, inject, OnInit } from '@angular/core';
+import { Component, inject, OnInit, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Router, RouterLink } from '@angular/router';
 import { FormsModule } from '@angular/forms';
+import { finalize } from 'rxjs';
 import { AccountService } from '../../services/account.service';
 import { AccountSummary } from '../../models/account.model';
 import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.component';
@@ -47,15 +48,15 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
       </div>
 
       <!-- Loading State -->
-      <div *ngIf="loading" class="loading-state">
+      <div *ngIf="loading()" class="loading-state">
         <div class="spinner"></div>
         <p>Loading email accounts...</p>
       </div>
 
       <!-- Account List Content -->
-      <div *ngIf="!loading">
+      <div *ngIf="!loading()">
         <!-- Empty State -->
-        <div *ngIf="accounts.length === 0" class="empty-state card">
+        <div *ngIf="accounts().length === 0" class="empty-state card">
           <div class="empty-icon">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
               <rect width="20" height="16" x="2" y="4" rx="2"/>
@@ -76,8 +77,8 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
         </div>
 
         <!-- Accounts Grid -->
-        <div *ngIf="accounts.length > 0" class="accounts-grid">
-          <div *ngFor="let acc of accounts" class="account-card card">
+        <div *ngIf="accounts().length > 0" class="accounts-grid">
+          <div *ngFor="let acc of accounts()" class="account-card card">
             <div class="account-card-header">
               <div>
                 <div class="account-title-row">
@@ -348,8 +349,8 @@ export class AccountListComponent implements OnInit {
   private accountService = inject(AccountService);
   private router = inject(Router);
 
-  accounts: AccountSummary[] = [];
-  loading = true;
+  accounts = signal<AccountSummary[]>([]);
+  loading = signal(true);
   errorMessage = '';
   successMessage = '';
 
@@ -362,16 +363,17 @@ export class AccountListComponent implements OnInit {
   }
 
   loadAccounts(): void {
-    this.loading = true;
+    this.loading.set(true);
     this.errorMessage = '';
 
-    this.accountService.getAccounts().subscribe({
+    this.accountService.getAccounts().pipe(
+      finalize(() => this.loading.set(false))
+    ).subscribe({
       next: (accounts) => {
-        this.accounts = accounts;
-        this.loading = false;
+        this.accounts.set(Array.isArray(accounts) ? accounts : []);
       },
       error: (err) => {
-        this.loading = false;
+        this.accounts.set([]);
         this.errorMessage = err?.error?.error || 'Failed to load email accounts.';
       }
     });

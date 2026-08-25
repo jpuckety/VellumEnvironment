@@ -61,6 +61,28 @@ type AccountResponse struct {
 	UpdatedAt    string `json:"updated_at,omitempty"`
 }
 
+func newAccountResponse(acc *types.Account) AccountResponse {
+	if acc == nil {
+		return AccountResponse{}
+	}
+	return AccountResponse{
+		ID:           acc.ID,
+		Name:         acc.Name,
+		IMAPHost:     acc.IMAPHost,
+		IMAPPort:     acc.IMAPPort,
+		IMAPUsername: acc.IMAPUsername,
+		IMAPUseTLS:   acc.IMAPUseTLS,
+		SMTPHost:     acc.SMTPHost,
+		SMTPPort:     acc.SMTPPort,
+		SMTPUsername: acc.SMTPUsername,
+		SMTPUseTLS:   acc.SMTPUseTLS,
+		FromAddress:  acc.FromAddress,
+		HasPassword:  acc.IMAPPassword != "" || acc.SMTPPassword != "",
+		CreatedAt:    formatTime(acc.CreatedAt),
+		UpdatedAt:    formatTime(acc.UpdatedAt),
+	}
+}
+
 func (s *Server) mountWebRoutes(mux *http.ServeMux) {
 	// Web authentication endpoints
 	mux.HandleFunc("GET /auth/login", s.handleWebLogin)
@@ -261,13 +283,17 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	summaries, err := s.configStore.ListUserConfigs(r.Context(), user.Subject)
+	accs, err := s.configStore.ListUserConfigs(r.Context(), user.Subject)
 	if err != nil {
 		s.logger.Error("failed to list user configs", "error", err, "user", user.Subject)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Failed to list email accounts"})
 		return
 	}
 
+	summaries := make([]AccountResponse, 0, len(accs))
+	for _, acc := range accs {
+		summaries = append(summaries, newAccountResponse(acc))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts": summaries,
 	})
@@ -300,24 +326,7 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := AccountResponse{
-		ID:           acc.ID,
-		Name:         acc.Name,
-		IMAPHost:     acc.IMAPHost,
-		IMAPPort:     acc.IMAPPort,
-		IMAPUsername: acc.IMAPUsername,
-		IMAPUseTLS:   acc.IMAPUseTLS,
-		SMTPHost:     acc.SMTPHost,
-		SMTPPort:     acc.SMTPPort,
-		SMTPUsername: acc.SMTPUsername,
-		SMTPUseTLS:   acc.SMTPUseTLS,
-		FromAddress:  acc.FromAddress,
-		HasPassword:  acc.IMAPPassword != "" || acc.SMTPPassword != "",
-		CreatedAt:    formatTime(acc.CreatedAt),
-		UpdatedAt:    formatTime(acc.UpdatedAt),
-	}
-
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, newAccountResponse(acc))
 }
 
 // POST /api/accounts - creates a new email account
@@ -412,22 +421,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 	s.imapMgr.DropPool(user.Subject, id)
 
-	writeJSON(w, http.StatusCreated, AccountResponse{
-		ID:           acc.ID,
-		Name:         acc.Name,
-		IMAPHost:     acc.IMAPHost,
-		IMAPPort:     acc.IMAPPort,
-		IMAPUsername: acc.IMAPUsername,
-		IMAPUseTLS:   acc.IMAPUseTLS,
-		SMTPHost:     acc.SMTPHost,
-		SMTPPort:     acc.SMTPPort,
-		SMTPUsername: acc.SMTPUsername,
-		SMTPUseTLS:   acc.SMTPUseTLS,
-		FromAddress:  acc.FromAddress,
-		HasPassword:  true,
-		CreatedAt:    formatTime(acc.CreatedAt),
-		UpdatedAt:    formatTime(acc.UpdatedAt),
-	})
+	writeJSON(w, http.StatusCreated, newAccountResponse(acc))
 }
 
 // PUT /api/accounts/{id} - modifies an existing email account
@@ -507,22 +501,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 	s.imapMgr.DropPool(user.Subject, id)
 
-	writeJSON(w, http.StatusOK, AccountResponse{
-		ID:           existing.ID,
-		Name:         existing.Name,
-		IMAPHost:     existing.IMAPHost,
-		IMAPPort:     existing.IMAPPort,
-		IMAPUsername: existing.IMAPUsername,
-		IMAPUseTLS:   existing.IMAPUseTLS,
-		SMTPHost:     existing.SMTPHost,
-		SMTPPort:     existing.SMTPPort,
-		SMTPUsername: existing.SMTPUsername,
-		SMTPUseTLS:   existing.SMTPUseTLS,
-		FromAddress:  existing.FromAddress,
-		HasPassword:  existing.IMAPPassword != "" || existing.SMTPPassword != "",
-		CreatedAt:    formatTime(existing.CreatedAt),
-		UpdatedAt:    formatTime(existing.UpdatedAt),
-	})
+	writeJSON(w, http.StatusOK, newAccountResponse(existing))
 }
 
 // DELETE /api/accounts/{id} - deletes an email account

@@ -12,8 +12,13 @@ export class AccountService {
   constructor(private http: HttpClient) {}
 
   getAccounts(): Observable<AccountSummary[]> {
-    return this.http.get<{ accounts: AccountSummary[] }>(this.baseUrl).pipe(
-      map(res => res.accounts || [])
+    return this.http.get<AccountSummary[] | { accounts?: AccountSummary[] | null }>(this.baseUrl).pipe(
+      map((res) => {
+        if (Array.isArray(res)) {
+          return res;
+        }
+        return Array.isArray(res?.accounts) ? res.accounts : [];
+      })
     );
   }
 

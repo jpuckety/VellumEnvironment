@@ -2,6 +2,7 @@ import { Component, inject, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import { finalize } from 'rxjs';
 import { AccountService } from '../../services/account.service';
 import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../../models/account.model';
 
@@ -703,17 +704,17 @@ export class AccountFormComponent implements OnInit {
     this.loadingAccount = true;
     this.errorMessage = '';
 
-    this.accountService.getAccount(id).subscribe({
+    this.accountService.getAccount(id).pipe(
+      finalize(() => this.loadingAccount = false)
+    ).subscribe({
       next: (acc) => {
         this.account = {
           ...acc,
           imap_password: '', // Blank initially in edit mode
           smtp_password: ''
         };
-        this.loadingAccount = false;
       },
       error: (err) => {
-        this.loadingAccount = false;
         this.errorMessage = err?.error?.error || `Failed to load account ${id}.`;
       }
     });

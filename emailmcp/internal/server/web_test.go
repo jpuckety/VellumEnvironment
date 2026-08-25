@@ -355,6 +355,42 @@ func TestAPIAccounts_FullCRUD(t *testing.T) {
 		t.Fatalf("unexpected created account: %+v", createdAcc)
 	}
 
+	// 2b. List must return the account without credential material.
+	reqListAfter, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/accounts", nil)
+	reqListAfter.Header.Set("Authorization", "Bearer "+token)
+	respListAfter, err := client.Do(reqListAfter)
+	if err != nil {
+		t.Fatalf("GET /api/accounts after create: %v", err)
+	}
+	listBody, _ := io.ReadAll(respListAfter.Body)
+	respListAfter.Body.Close()
+	if respListAfter.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/accounts after create status = %d, want 200; body = %s", respListAfter.StatusCode, listBody)
+	}
+	if strings.Contains(string(listBody), "secret-imap-password") || strings.Contains(string(listBody), "secret-smtp-password") {
+		t.Fatalf("GET /api/accounts leaked a password: %s", listBody)
+	}
+	var listed struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(listBody, &listed); err != nil {
+		t.Fatalf("decode list after create: %v\nbody = %s", err, listBody)
+	}
+	if len(listed.Accounts) != 1 {
+		t.Fatalf("expected 1 listed account, got %d: %s", len(listed.Accounts), listBody)
+	}
+	for _, key := range []string{"password", "imap_password", "smtp_password"} {
+		if _, ok := listed.Accounts[0][key]; ok {
+			t.Fatalf("GET /api/accounts included %q: %s", key, listBody)
+		}
+	}
+	if listed.Accounts[0]["id"] != "work-mail" || listed.Accounts[0]["imap_username"] != "worker@fastmail.com" {
+		t.Fatalf("unexpected listed account: %s", listBody)
+	}
+	if listed.Accounts[0]["has_password"] != true {
+		t.Fatalf("expected has_password=true, got %s", listBody)
+	}
+
 	// 3. Get single account (GET /api/accounts/work-mail)
 	reqGet, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/accounts/work-mail", nil)
 	reqGet.Header.Set("Authorization", "Bearer "+token)
@@ -366,8 +402,14 @@ func TestAPIAccounts_FullCRUD(t *testing.T) {
 	if respGet.StatusCode != http.StatusOK {
 		t.Fatalf("GET /api/accounts/work-mail status = %d, want 200", respGet.StatusCode)
 	}
+	getBody, _ := io.ReadAll(respGet.Body)
+	if strings.Contains(string(getBody), "secret-imap-password") || strings.Contains(string(getBody), "secret-smtp-password") {
+		t.Fatalf("GET /api/accounts/work-mail leaked a password: %s", getBody)
+	}
 	var gotAcc AccountResponse
-	_ = json.NewDecoder(respGet.Body).Decode(&gotAcc)
+	if err := json.Unmarshal(getBody, &gotAcc); err != nil {
+		t.Fatalf("decode got account: %v", err)
+	}
 	if gotAcc.ID != "work-mail" || gotAcc.IMAPHost != "imap.fastmail.com" || !gotAcc.HasPassword {
 		t.Fatalf("unexpected got account: %+v", gotAcc)
 	}
