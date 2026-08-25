@@ -374,11 +374,10 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
                   <line x1="12" y1="8" x2="12" y2="12"/>
                   <line x1="12" y1="16" x2="12.01" y2="16"/>
                 </svg>
-                The <strong>Verify</strong> button is accessible only after entering a password above.
+                Enter a password above to verify a new account.
               </span>
             </div>
 
-            <!-- Crucial: Verify Button accessible ONLY when password has been provided -->
             <button
               type="button"
               id="verifyButton"
@@ -749,14 +748,16 @@ export class AccountFormComponent implements OnInit {
   }
 
   /**
-   * The Verify button should only be accessible when a password has been provided.
-   * This is a key requirement: the user enters the password here securely
-   * without exposing it to the LLM, and verifies it with the Verify button.
+   * Verify is available when a password is typed in the form, or when editing
+   * an account that already has a stored password (leave the fields blank).
    */
   canVerify(): boolean {
     const hasImapPass = !!(this.account.imap_password && this.account.imap_password.trim().length > 0);
     const hasSmtpPass = !!(this.account.smtp_password && this.account.smtp_password.trim().length > 0);
-    return hasImapPass || hasSmtpPass;
+    if (hasImapPass || hasSmtpPass) {
+      return true;
+    }
+    return this.isEditMode && !!this.account.has_password && !!this.account.id;
   }
 
   verifyConnection(): void {

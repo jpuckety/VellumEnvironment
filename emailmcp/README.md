@@ -104,7 +104,7 @@ Cloud deploy and teardown are handled by MCPCICD, not this `run.sh`.
 
 | Tool                  | Description                                              |
 |-----------------------|----------------------------------------------------------|
-| `add_email_account`   | Create/replace the user's IMAP + SMTP account          |
+| `add_email_account`   | Create/replace the user's IMAP + SMTP account (set passwords in the portal) |
 | `list_email_accounts` | List the user's account (no secrets)                     |
 | `remove_email_account`| Delete the user's account config                         |
 | `list_folders`        | List IMAP mailboxes                                      |

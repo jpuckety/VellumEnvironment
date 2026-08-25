@@ -16,6 +16,7 @@ import { HeaderComponent } from './components/header/header.component';
       <footer class="app-footer">
         <div class="footer-container">
           <span>EmailMCP Account Manager &bull; Secure Email Authentication for MCP</span>
+          <span class="copyright">&copy; 2026 Pitaya Group, LLC</span>
         </div>
       </footer>
     </div>
@@ -44,6 +45,13 @@ import { HeaderComponent } from './components/header/header.component';
     .footer-container {
       max-width: 1024px;
       margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .copyright {
+      color: var(--gray-400);
     }
   `]
 })

@@ -329,13 +329,15 @@ func (r *statusRecorder) Flush() {
 func (s *Server) registerTools() {
 	// Account management (Config API)
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "add_email_account",
-		Description: "Create or replace the authenticated user's email account (IMAP + SMTP). Credentials are stored via the Config API.",
+		Name: "add_email_account",
+		Description: "Create or replace the authenticated user's email account (IMAP + SMTP). " +
+			"Do not send passwords; set IMAP and SMTP passwords in the user portal after the account is created.",
 	}, s.addEmailAccount)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "list_email_accounts",
-		Description: "List the authenticated user's configured email accounts (without credentials).",
+		Name: "list_email_accounts",
+		Description: "List the authenticated user's configured email accounts (without credentials). " +
+			"Returns an empty list with setup guidance when the user has no accounts.",
 	}, s.listEmailAccounts)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -393,14 +395,12 @@ type AddAccountInput struct {
 	IMAPHost     string `json:"imap_host"`
 	IMAPPort     int    `json:"imap_port" jsonschema:"default:993"`
 	IMAPUsername string `json:"imap_username"`
-	IMAPPassword string `json:"imap_password" jsonschema:"The IMAP password (stored in Secrets Manager)"`
 	// Pointer so JSON omission honors default true (zero-value bool would be false).
 	IMAPUseTLS *bool `json:"imap_use_tls,omitempty" jsonschema:"default:true"`
 
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port" jsonschema:"default:587"`
 	SMTPUsername string `json:"smtp_username"`
-	SMTPPassword string `json:"smtp_password" jsonschema:"The SMTP password; defaults to IMAP password when empty"`
 	SMTPUseTLS   *bool  `json:"smtp_use_tls,omitempty" jsonschema:"default:true"`
 
 	FromAddress string `json:"from_address,omitempty"`
@@ -476,9 +476,6 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 	if in.Name == "" || in.IMAPHost == "" || in.IMAPUsername == "" || in.SMTPHost == "" {
 		return nil, nil, errors.New("required fields missing: name, imap_host, imap_username, smtp_host")
 	}
-	if in.IMAPPassword == "" {
-		return nil, nil, errors.New("imap_password is required")
-	}
 
 	imapUseTLS := boolDefault(in.IMAPUseTLS, true)
 	smtpUseTLS := boolDefault(in.SMTPUseTLS, true)
@@ -500,10 +497,6 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 	if smtpUser == "" {
 		smtpUser = in.IMAPUsername
 	}
-	smtpPass := in.SMTPPassword
-	if smtpPass == "" {
-		smtpPass = in.IMAPPassword
-	}
 
 	// Generate a slug from name if ID is not provided
 	accountID := in.ID
@@ -514,6 +507,14 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		accountID = "default"
 	}
 
+	// Passwords are set only via the user portal. Preserve any already stored
+	// credentials when this tool replaces an existing account.
+	var imapPass, smtpPass string
+	if existing, err := s.configStore.GetUserConfig(ctx, user.Subject, accountID); err == nil && existing != nil {
+		imapPass = existing.IMAPPassword
+		smtpPass = existing.SMTPPassword
+	}
+
 	acc := &types.Account{
 		ID:           accountID,
 		OwnerUserID:  user.Subject,
@@ -521,7 +522,7 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 		IMAPHost:     in.IMAPHost,
 		IMAPPort:     defaultPort(in.IMAPPort, 993),
 		IMAPUsername: in.IMAPUsername,
-		IMAPPassword: in.IMAPPassword,
+		IMAPPassword: imapPass,
 		IMAPUseTLS:   imapUseTLS,
 		SMTPHost:     in.SMTPHost,
 		SMTPPort:     defaultPort(in.SMTPPort, 587),
@@ -542,9 +543,18 @@ func (s *Server) addEmailAccount(ctx context.Context, req *mcp.CallToolRequest, 
 
 	s.logger.Info("account added", "id", acc.ID, "name", acc.Name, "owner", user.Subject)
 
+	portalURL := s.portalURL()
+	msg := fmt.Sprintf("Account saved successfully. ID: %s. Provide IMAP and SMTP passwords in the user portal.", acc.ID)
+	if portalURL != "" {
+		msg = fmt.Sprintf("Account saved successfully. ID: %s. Provide IMAP and SMTP passwords in the user portal at %s.", acc.ID, portalURL)
+	}
+	out := map[string]any{"id": acc.ID}
+	if portalURL != "" {
+		out["portal_url"] = portalURL
+	}
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Account saved successfully. ID: %s", acc.ID)}},
-	}, map[string]any{"id": acc.ID}, nil
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+	}, out, nil
 }
 
 func (s *Server) listEmailAccounts(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
@@ -555,7 +565,10 @@ func (s *Server) listEmailAccounts(ctx context.Context, req *mcp.CallToolRequest
 
 	accs, err := s.configStore.ListUserConfigs(ctx, user.Subject)
 	if err != nil {
-		return nil, nil, err
+		if !errors.Is(err, config.ErrConfigNotFound) {
+			return nil, nil, err
+		}
+		accs = nil
 	}
 
 	summaries := make([]types.AccountSummary, 0, len(accs))
@@ -572,7 +585,22 @@ func (s *Server) listEmailAccounts(ctx context.Context, req *mcp.CallToolRequest
 			UpdatedAt:   acc.UpdatedAt,
 		})
 	}
-	return nil, map[string]any{"accounts": summaries}, nil
+
+	out := map[string]any{"accounts": summaries}
+	if len(summaries) > 0 {
+		return nil, out, nil
+	}
+
+	portalURL := s.portalURL()
+	msg := "No email accounts are configured. Use add_email_account to create one, then set IMAP and SMTP passwords in the user portal."
+	if portalURL != "" {
+		msg = fmt.Sprintf("No email accounts are configured. Use add_email_account to create one, then set IMAP and SMTP passwords in the user portal at %s.", portalURL)
+		out["portal_url"] = portalURL
+	}
+	out["message"] = msg
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+	}, out, nil
 }
 
 func (s *Server) removeEmailAccount(ctx context.Context, req *mcp.CallToolRequest, in AccountIDInput) (*mcp.CallToolResult, any, error) {
@@ -775,6 +803,13 @@ func validateAccountEndpoints(acc *types.Account) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Server) portalURL() string {
+	if s == nil || s.cfg == nil || s.cfg.PublicBaseURL == "" {
+		return ""
+	}
+	return strings.TrimRight(s.cfg.PublicBaseURL, "/") + "/portal"
 }
 
 func defaultPort(p, def int) int {
