@@ -3,7 +3,7 @@
 # ============================================================================
 # Frontend stage: build the Angular web application
 # ============================================================================
-FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
 WORKDIR /web
 
 COPY web/package*.json ./
