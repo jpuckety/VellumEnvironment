@@ -137,7 +137,7 @@ describe('EmailMcpStack', () => {
     expect(app.EntryPoint).toBeUndefined();
   });
 
-  test('pipeline roles are imported and granted by name', () => {
+  test('pipeline roles are imported by name without creating them', () => {
     const template = synth();
     const roles = Object.values(template.findResources('AWS::IAM::Role'));
     expect(roles.some((role) => role.Properties?.RoleName === ECR_PUSH_ROLE_NAME)).toBe(false);
@@ -145,8 +145,16 @@ describe('EmailMcpStack', () => {
     const json = JSON.stringify(template.toJSON());
     expect(json).toContain(ECR_PUSH_ROLE_NAME);
     expect(json).toContain(PIPELINE_DEPLOY_ROLE_NAME);
-    expect(json).toContain('ecs:DescribeTaskDefinition');
-    expect(json).toContain(PIPELINE_ACCOUNT);
+    expect(json).toContain('/email-mcp/pipeline/ecr-push-role-arn');
+    expect(json).toContain('/email-mcp/pipeline/pipeline-deploy-role-arn');
+  });
+
+  test('does not attach CloudFormation policies to the shared pipeline roles', () => {
+    const template = synth();
+    const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
+    expect(policies).not.toContain(ECR_PUSH_ROLE_NAME);
+    expect(policies).not.toContain(PIPELINE_DEPLOY_ROLE_NAME);
+    expect(policies).not.toContain('EcrPushRolePolicy');
   });
 
   test('container name, port, and health path match the Dockerfile contract', () => {

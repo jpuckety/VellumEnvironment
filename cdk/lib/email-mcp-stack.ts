@@ -596,71 +596,12 @@ export class EmailMcpStack extends cdk.Stack {
     });
 
     if (pipelineAccount) {
+      // OrganizationStack creates these names with AdministratorAccess. Do not
+      // attach extra AWS::IAM::Policy resources: BroadWorksMcpStack already
+      // owns EcrPushRole/Policy (same generated name) and CloudFormation
+      // rejects a second manager.
       const ecrPushRole = iam.Role.fromRoleName(this, 'EcrPushRole', ECR_PUSH_ROLE_NAME);
-      this.repository.grantPullPush(ecrPushRole);
-      ecrPushRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          actions: ['ecr:GetAuthorizationToken'],
-          resources: ['*'],
-        }),
-      );
-      ecrPushRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          actions: ['ecs:DescribeTaskDefinition', 'ecs:DescribeServices', 'ecs:DescribeClusters'],
-          resources: ['*'],
-        }),
-      );
-
       const pipelineDeployRole = iam.Role.fromRoleName(this, 'PipelineDeployRole', PIPELINE_DEPLOY_ROLE_NAME);
-      pipelineDeployRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          actions: [
-            'codedeploy:CreateDeployment',
-            'codedeploy:GetDeployment',
-            'codedeploy:GetDeploymentConfig',
-            'codedeploy:GetApplication',
-            'codedeploy:GetApplicationRevision',
-            'codedeploy:RegisterApplicationRevision',
-            'codedeploy:GetDeploymentGroup',
-          ],
-          resources: ['*'],
-        }),
-      );
-      pipelineDeployRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          actions: ['ecs:RegisterTaskDefinition', 'ecs:DescribeTaskDefinition', 'ecs:DescribeServices', 'ecs:DescribeClusters'],
-          resources: ['*'],
-        }),
-      );
-      pipelineDeployRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          actions: ['iam:PassRole'],
-          resources: [taskRole.roleArn, executionRole.roleArn],
-          conditions: {
-            StringEquals: { 'iam:PassedToService': 'ecs-tasks.amazonaws.com' },
-          },
-        }),
-      );
-      pipelineDeployRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          sid: 'PipelineArtifacts',
-          actions: ['s3:GetObject', 's3:GetObjectVersion'],
-          resources: ['*'],
-          conditions: {
-            StringEquals: { 'aws:ResourceAccount': pipelineAccount },
-          },
-        }),
-      );
-      pipelineDeployRole.addToPrincipalPolicy(
-        new iam.PolicyStatement({
-          sid: 'PipelineKms',
-          actions: ['kms:Decrypt', 'kms:DescribeKey', 'kms:GenerateDataKey'],
-          resources: ['*'],
-          conditions: {
-            StringEquals: { 'aws:ResourceAccount': pipelineAccount },
-          },
-        }),
-      );
 
       new ssm.StringParameter(this, 'EcrUriParameter', {
         parameterName: '/email-mcp/pipeline/ecr-uri',
