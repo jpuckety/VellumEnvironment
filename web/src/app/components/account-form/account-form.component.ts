@@ -1,4 +1,4 @@
-import { Component, inject, OnInit } from '@angular/core';
+import { Component, inject, OnInit, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
@@ -29,13 +29,13 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
       </div>
 
       <!-- Alerts -->
-      <div *ngIf="errorMessage" class="alert alert-danger">
+      <div *ngIf="errorMessage()" class="alert alert-danger">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
           <circle cx="12" cy="12" r="10"/>
           <line x1="12" y1="8" x2="12" y2="12"/>
           <line x1="12" y1="16" x2="12.01" y2="16"/>
         </svg>
-        <span>{{ errorMessage }}</span>
+        <span>{{ errorMessage() }}</span>
       </div>
 
       <!-- Verification Result Alert -->
@@ -67,12 +67,12 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
       </div>
 
       <!-- Loading Account Details -->
-      <div *ngIf="loadingAccount" class="loading-state">
+      <div *ngIf="loadingAccount()" class="loading-state">
         <div class="spinner"></div>
         <p>Loading account details...</p>
       </div>
 
-      <form *ngIf="!loadingAccount" (ngSubmit)="saveAccount()" #accountForm="ngForm" class="form-wrapper">
+      <form *ngIf="!loadingAccount()" (ngSubmit)="saveAccount()" #accountForm="ngForm" class="form-wrapper">
         <!-- Preset Selector (New Account) -->
         <div *ngIf="!isEditMode" class="card preset-card">
           <h3 class="card-section-title">Quick Presets</h3>
@@ -661,10 +661,10 @@ export class AccountFormComponent implements OnInit {
 
   isEditMode = false;
   accountIdParam = '';
-  loadingAccount = false;
+  loadingAccount = signal(false);
   saving = false;
   verifying = false;
-  errorMessage = '';
+  errorMessage = signal('');
 
   showImapPassword = false;
   showSmtpPassword = false;
@@ -701,11 +701,11 @@ export class AccountFormComponent implements OnInit {
   }
 
   loadAccount(id: string): void {
-    this.loadingAccount = true;
-    this.errorMessage = '';
+    this.loadingAccount.set(true);
+    this.errorMessage.set('');
 
     this.accountService.getAccount(id).pipe(
-      finalize(() => this.loadingAccount = false)
+      finalize(() => this.loadingAccount.set(false))
     ).subscribe({
       next: (acc) => {
         this.account = {
@@ -715,7 +715,7 @@ export class AccountFormComponent implements OnInit {
         };
       },
       error: (err) => {
-        this.errorMessage = err?.error?.error || `Failed to load account ${id}.`;
+        this.errorMessage.set(err?.error?.error || `Failed to load account ${id}.`);
       }
     });
   }
@@ -764,7 +764,7 @@ export class AccountFormComponent implements OnInit {
 
     this.verifying = true;
     this.verificationResult = null;
-    this.errorMessage = '';
+    this.errorMessage.set('');
 
     const req: VerifyRequest = {
       id: this.account.id,
@@ -799,7 +799,7 @@ export class AccountFormComponent implements OnInit {
 
   saveAccount(): void {
     this.saving = true;
-    this.errorMessage = '';
+    this.errorMessage.set('');
 
     // Clean up input types
     const payload: Partial<Account> = {
@@ -834,7 +834,7 @@ export class AccountFormComponent implements OnInit {
       },
       error: (err) => {
         this.saving = false;
-        this.errorMessage = err?.error?.error || 'Failed to save email account.';
+        this.errorMessage.set(err?.error?.error || 'Failed to save email account.');
       }
     });
   }
