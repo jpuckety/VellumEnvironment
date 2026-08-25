@@ -68,3 +68,100 @@ func TestVerifyAccountCredentials_Validation(t *testing.T) {
 		t.Fatal("expected verify to fail when TLS is disabled on remote host")
 	}
 }
+
+func TestVerifyAccountCredentials_NilAccount(t *testing.T) {
+	srv := &Server{}
+	res := srv.VerifyAccountCredentials(context.Background(), nil)
+	if res == nil {
+		t.Fatal("expected non-nil verification result for nil account")
+	}
+	if res.Success {
+		t.Error("expected verification to fail for nil account")
+	}
+	if res.IMAP.Error != "account is required" {
+		t.Errorf("unexpected IMAP error for nil account: %s", res.IMAP.Error)
+	}
+	if res.SMTP.Error != "account is required" {
+		t.Errorf("unexpected SMTP error for nil account: %s", res.SMTP.Error)
+	}
+}
+
+func TestVerifyAccountCredentials_MissingFields(t *testing.T) {
+	srv := &Server{}
+	ctx := context.Background()
+
+	// Missing IMAPHost
+	res := srv.VerifyAccountCredentials(ctx, &types.Account{
+		IMAPUsername: "user",
+		IMAPPassword: "pwd",
+		SMTPHost:     "smtp.gmail.com",
+		SMTPUsername: "user",
+		SMTPPassword: "pwd",
+	})
+	if res.IMAP.Error != "IMAP host is required" {
+		t.Errorf("unexpected error for missing IMAP host: %s", res.IMAP.Error)
+	}
+
+	// Missing IMAPUsername
+	res = srv.VerifyAccountCredentials(ctx, &types.Account{
+		IMAPHost:     "imap.gmail.com",
+		IMAPPassword: "pwd",
+		SMTPHost:     "smtp.gmail.com",
+		SMTPUsername: "user",
+		SMTPPassword: "pwd",
+	})
+	if res.IMAP.Error != "IMAP username is required" {
+		t.Errorf("unexpected error for missing IMAP username: %s", res.IMAP.Error)
+	}
+
+	// Missing SMTPHost
+	res = srv.VerifyAccountCredentials(ctx, &types.Account{
+		IMAPHost:     "imap.gmail.com",
+		IMAPUsername: "user",
+		IMAPPassword: "pwd",
+		IMAPUseTLS:   true,
+	})
+	if res.SMTP.Error != "SMTP host is required" {
+		t.Errorf("unexpected error for missing SMTP host: %s", res.SMTP.Error)
+	}
+
+	// Missing SMTPUsername (when IMAPUsername is empty)
+	res = srv.VerifyAccountCredentials(ctx, &types.Account{
+		IMAPHost:     "imap.gmail.com",
+		IMAPPassword: "pwd",
+		IMAPUseTLS:   true,
+		SMTPHost:     "smtp.gmail.com",
+		SMTPPassword: "pwd",
+		SMTPUseTLS:   true,
+	})
+	if res.SMTP.Error != "SMTP username is required" {
+		t.Errorf("unexpected error for missing SMTP username: %s", res.SMTP.Error)
+	}
+}
+
+func TestVerifyAccountCredentials_CancelledContext(t *testing.T) {
+	srv := &Server{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	acc := &types.Account{
+		IMAPHost:     "imap.gmail.com",
+		IMAPPort:     993,
+		IMAPUsername: "user@gmail.com",
+		IMAPPassword: "password123",
+		IMAPUseTLS:   true,
+		SMTPHost:     "smtp.gmail.com",
+		SMTPPort:     587,
+		SMTPUsername: "user@gmail.com",
+		SMTPPassword: "password123",
+		SMTPUseTLS:   true,
+	}
+
+	res := srv.VerifyAccountCredentials(ctx, acc)
+	if res.Success {
+		t.Fatal("expected verify to fail on canceled context")
+	}
+	if res.IMAP.Success || res.SMTP.Success {
+		t.Fatalf("expected both IMAP and SMTP to fail on canceled context: %+v", res)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	net_smtp "net/smtp"
+	"strconv"
 	"time"
 
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -31,6 +32,14 @@ type VerificationResult struct {
 // VerifyAccountCredentials verifies that both IMAP and SMTP endpoints are reachable
 // and that the provided credentials authenticate successfully.
 func (s *Server) VerifyAccountCredentials(ctx context.Context, acc *types.Account) *VerificationResult {
+	if acc == nil {
+		return &VerificationResult{
+			Success: false,
+			IMAP:    ComponentVerification{Success: false, Error: "account is required"},
+			SMTP:    ComponentVerification{Success: false, Error: "account is required"},
+		}
+	}
+
 	res := &VerificationResult{
 		Success: true,
 	}
@@ -75,39 +84,56 @@ func (s *Server) verifyIMAP(ctx context.Context, acc *types.Account) ComponentVe
 		}
 	}
 
-	addr := fmt.Sprintf("%s:%d", acc.IMAPHost, port)
+	addr := net.JoinHostPort(acc.IMAPHost, strconv.Itoa(port))
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	type dialResult struct {
-		client *imapclient.Client
-		err    error
+	var conn net.Conn
+	dialer := &net.Dialer{}
+
+	if acc.IMAPUseTLS {
+		tlsConfig := &tls.Config{
+			ServerName: acc.IMAPHost,
+			MinVersion: tls.VersionTLS12,
+		}
+		rawConn, err := dialer.DialContext(timeoutCtx, "tcp", addr)
+		if err != nil {
+			if timeoutCtx.Err() != nil {
+				return ComponentVerification{Success: false, Error: fmt.Sprintf("IMAP connection timed out to %s", addr)}
+			}
+			return ComponentVerification{Success: false, Error: fmt.Sprintf("failed to connect to IMAP %s: %v", addr, err)}
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(timeoutCtx); err != nil {
+			_ = rawConn.Close()
+			if timeoutCtx.Err() != nil {
+				return ComponentVerification{Success: false, Error: fmt.Sprintf("IMAP connection timed out to %s", addr)}
+			}
+			return ComponentVerification{Success: false, Error: fmt.Sprintf("failed to connect to IMAP %s: %v", addr, err)}
+		}
+		conn = tlsConn
+	} else {
+		var dialErr error
+		conn, dialErr = dialer.DialContext(timeoutCtx, "tcp", addr)
+		if dialErr != nil {
+			if timeoutCtx.Err() != nil {
+				return ComponentVerification{Success: false, Error: fmt.Sprintf("IMAP connection timed out to %s", addr)}
+			}
+			return ComponentVerification{Success: false, Error: fmt.Sprintf("failed to connect to IMAP %s: %v", addr, dialErr)}
+		}
 	}
 
-	done := make(chan dialResult, 1)
-	go func() {
-		var client *imapclient.Client
-		var err error
-		if acc.IMAPUseTLS {
-			client, err = imapclient.DialTLS(addr, &imapclient.Options{})
-		} else {
-			client, err = imapclient.DialInsecure(addr, &imapclient.Options{})
-		}
-		done <- dialResult{client: client, err: err}
+	// Close conn if context is canceled or times out during greeting or login
+	stopCancel := context.AfterFunc(timeoutCtx, func() {
+		_ = conn.Close()
+	})
+	defer stopCancel()
+
+	client := imapclient.New(conn, &imapclient.Options{})
+	defer func() {
+		_ = client.Close()
 	}()
-
-	var client *imapclient.Client
-	select {
-	case <-timeoutCtx.Done():
-		return ComponentVerification{Success: false, Error: fmt.Sprintf("IMAP connection timed out to %s", addr)}
-	case r := <-done:
-		if r.err != nil {
-			return ComponentVerification{Success: false, Error: fmt.Sprintf("failed to connect to IMAP %s: %v", addr, r.err)}
-		}
-		client = r.client
-	}
-	defer client.Close()
 
 	loginDone := make(chan error, 1)
 	go func() {
@@ -119,6 +145,9 @@ func (s *Server) verifyIMAP(ctx context.Context, acc *types.Account) ComponentVe
 	case <-timeoutCtx.Done():
 		return ComponentVerification{Success: false, Error: "IMAP authentication timed out"}
 	case err := <-loginDone:
+		if timeoutCtx.Err() != nil {
+			return ComponentVerification{Success: false, Error: "IMAP authentication timed out"}
+		}
 		if err != nil {
 			return ComponentVerification{Success: false, Error: fmt.Sprintf("IMAP authentication failed: %v", err)}
 		}
@@ -167,7 +196,7 @@ func (s *Server) verifySMTP(ctx context.Context, acc *types.Account) ComponentVe
 		}
 	}
 
-	addr := fmt.Sprintf("%s:%d", acc.SMTPHost, port)
+	addr := net.JoinHostPort(acc.SMTPHost, strconv.Itoa(port))
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -181,6 +210,9 @@ func (s *Server) verifySMTP(ctx context.Context, acc *types.Account) ComponentVe
 	case <-timeoutCtx.Done():
 		return ComponentVerification{Success: false, Error: fmt.Sprintf("SMTP connection timed out to %s", addr)}
 	case err := <-errChan:
+		if timeoutCtx.Err() != nil {
+			return ComponentVerification{Success: false, Error: fmt.Sprintf("SMTP connection timed out to %s", addr)}
+		}
 		if err != nil {
 			return ComponentVerification{Success: false, Error: err.Error()}
 		}
@@ -198,51 +230,62 @@ func (s *Server) dialAndAuthSMTP(ctx context.Context, addr, host string, port in
 		MinVersion: tls.VersionTLS12,
 	}
 
-	var client *net_smtp.Client
-	var err error
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	var conn net.Conn
 
 	if useTLS && port == 465 {
 		// Implicit TLS on port 465
-		dialer := &net.Dialer{Timeout: 8 * time.Second}
-		conn, dialErr := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+		rawConn, dialErr := dialer.DialContext(ctx, "tcp", addr)
 		if dialErr != nil {
 			return fmt.Errorf("TLS connection to %s failed: %w", addr, dialErr)
 		}
-		defer conn.Close()
-
-		client, err = net_smtp.NewClient(conn, host)
-		if err != nil {
-			return fmt.Errorf("SMTP handshake with %s failed: %w", addr, err)
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return fmt.Errorf("TLS handshake with %s failed: %w", addr, err)
 		}
+		conn = tlsConn
 	} else {
 		// Plain connection with optional STARTTLS (port 587 / 25)
-		dialer := &net.Dialer{Timeout: 8 * time.Second}
-		conn, dialErr := dialer.DialContext(ctx, "tcp", addr)
+		var dialErr error
+		conn, dialErr = dialer.DialContext(ctx, "tcp", addr)
 		if dialErr != nil {
 			return fmt.Errorf("connection to %s failed: %w", addr, dialErr)
 		}
-		defer conn.Close()
+	}
 
-		client, err = net_smtp.NewClient(conn, host)
-		if err != nil {
-			return fmt.Errorf("SMTP handshake with %s failed: %w", addr, err)
-		}
+	// Close conn if context is canceled or times out during subsequent blocking operations
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stopCancel()
 
-		if useTLS {
-			if ok, _ := client.Extension("STARTTLS"); ok {
-				if err := client.StartTLS(tlsConfig); err != nil {
-					return fmt.Errorf("STARTTLS negotiation failed: %w", err)
-				}
-			} else {
-				return errors.New("server does not support STARTTLS")
+	client, err := net_smtp.NewClient(conn, host)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("SMTP handshake with %s failed: %w", addr, err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+
+	if useTLS && port != 465 {
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.StartTLS(tlsConfig); err != nil {
+				return fmt.Errorf("STARTTLS negotiation failed: %w", err)
 			}
+		} else {
+			return errors.New("server does not support STARTTLS")
 		}
 	}
-	defer client.Close()
 
 	auth := net_smtp.PlainAuth("", user, pass, host)
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("SMTP authentication failed: %w", err)
+	}
+
+	if err := client.Quit(); err != nil {
+		_ = err
 	}
 
 	return nil
