@@ -752,11 +752,11 @@ export class AccountFormComponent implements OnInit {
    * Verify is available only for a saved account whose form has no unsaved changes.
    * Verification always uses the previously stored settings, not the live form.
    */
-  canVerify(formDirty = false): boolean {
+  canVerify(formDirty: boolean | null = false): boolean {
     return this.isEditMode && !!this.account.id && !!this.account.has_password && !formDirty;
   }
 
-  verifyHint(formDirty = false): string {
+  verifyHint(formDirty: boolean | null = false): string {
     if (!this.isEditMode || !this.account.id) {
       return 'Save the account first, then verify the stored connection.';
     }
@@ -769,7 +769,7 @@ export class AccountFormComponent implements OnInit {
     return '';
   }
 
-  verifyConnection(formDirty = false): void {
+  verifyConnection(formDirty: boolean | null = false): void {
     if (!this.canVerify(formDirty) || this.verifying()) return;
 
     this.verifying.set(true);
