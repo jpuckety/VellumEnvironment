@@ -60,8 +60,12 @@ export class EmailMcpStack extends cdk.Stack {
     super(scope, id, props);
 
     const applicationId = this.node.tryGetContext('applicationId') ?? process.env.APPLICATION_ID ?? 'email-mcp';
+    const extraContainerEnv = parseContainerEnvContext(this);
     const oauthRedirectAllowlist =
-      this.node.tryGetContext('oauthRedirectAllowlist') ?? process.env.OAUTH_REDIRECT_ALLOWLIST ?? '';
+      extraContainerEnv.OAUTH_REDIRECT_ALLOWLIST ??
+      this.node.tryGetContext('oauthRedirectAllowlist') ??
+      process.env.OAUTH_REDIRECT_ALLOWLIST ??
+      '';
     const ssmNames = this.node.tryGetContext('ssm') ?? {};
 
     const hostname: string | undefined = props.hostname ?? this.node.tryGetContext('hostname');
@@ -317,6 +321,7 @@ export class EmailMcpStack extends cdk.Stack {
         AWS_REGION: this.region,
         OAUTH_REDIRECT_ALLOWLIST: oauthRedirectAllowlist,
         PUBLIC_BASE_URL: publicBaseUrl,
+        ...extraContainerEnv,
       },
       secrets: {
         GOOGLE_CLIENT_ID: ecs.Secret.fromSsmParameter(googleClientId),
@@ -663,4 +668,36 @@ export class EmailMcpStack extends cdk.Stack {
       );
     }
   }
+}
+
+const CONTAINER_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** MCPCICD CdkDev/CdkProd pass `-c containerEnv=<json>` for non-secret task env vars. */
+function parseContainerEnvContext(scope: Construct): Record<string, string> {
+  const raw = scope.node.tryGetContext('containerEnv');
+  if (raw === undefined || raw === null || raw === '') {
+    return {};
+  }
+  let record: unknown = raw;
+  if (typeof record === 'string') {
+    try {
+      record = JSON.parse(record);
+    } catch {
+      throw new Error("context 'containerEnv' must be a JSON object of string values");
+    }
+  }
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    throw new Error("context 'containerEnv' must be an object of string values");
+  }
+  const out: Record<string, string> = {};
+  for (const [name, entry] of Object.entries(record as Record<string, unknown>)) {
+    if (!CONTAINER_ENV_NAME.test(name)) {
+      throw new Error(`context 'containerEnv' has invalid environment variable name '${name}'`);
+    }
+    if (typeof entry !== 'string') {
+      throw new Error(`context 'containerEnv.${name}' must be a string`);
+    }
+    out[name] = entry;
+  }
+  return out;
 }

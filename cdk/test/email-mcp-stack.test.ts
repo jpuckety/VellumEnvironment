@@ -137,6 +137,33 @@ describe('EmailMcpStack', () => {
     expect(app.EntryPoint).toBeUndefined();
   });
 
+  test('merges pipeline containerEnv onto the app container', () => {
+    const app = new cdk.App({
+      context: {
+        containerEnv: {
+          OAUTH_REDIRECT_ALLOWLIST: 'https://www.cursor.com/agents/mcp/oauth/callback',
+          OAUTH_ALLOW_KNOWN_CLIENTS: 'true',
+        },
+      },
+    });
+    const template = Template.fromStack(
+      new EmailMcpStack(app, 'Test', {
+        env: { account: ENV_ACCOUNT, region: REGION },
+        allowInsecureHttp: true,
+        pipelineAccount: PIPELINE_ACCOUNT,
+      }),
+    );
+    const taskDefs = Object.values(template.findResources('AWS::ECS::TaskDefinition'));
+    const container = taskDefs[0].Properties.ContainerDefinitions.find(
+      (c: { Name: string }) => c.Name === APP_CONTAINER_NAME,
+    );
+    const env = Object.fromEntries(
+      (container.Environment as Array<{ Name: string; Value: string }>).map((entry) => [entry.Name, entry.Value]),
+    );
+    expect(env.OAUTH_REDIRECT_ALLOWLIST).toBe('https://www.cursor.com/agents/mcp/oauth/callback');
+    expect(env.OAUTH_ALLOW_KNOWN_CLIENTS).toBe('true');
+  });
+
   test('pipeline roles are imported by name without creating them', () => {
     const template = synth();
     const roles = Object.values(template.findResources('AWS::IAM::Role'));
