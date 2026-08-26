@@ -283,9 +283,10 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
     }
 
     .account-details {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 10px 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 28px;
       background-color: var(--gray-50);
       padding: 12px 16px;
       border-radius: var(--radius-sm);
@@ -296,12 +297,14 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
       display: flex;
       align-items: center;
       gap: 8px;
+      min-width: 0;
+      white-space: nowrap;
     }
 
     .detail-label {
       color: var(--gray-500);
       font-weight: 500;
-      min-width: 90px;
+      flex-shrink: 0;
     }
 
     .detail-value {
@@ -309,6 +312,7 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
       display: flex;
       align-items: center;
       gap: 6px;
+      min-width: 0;
     }
 
     .detail-value code {
@@ -318,10 +322,11 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
       padding: 2px 6px;
       border-radius: 4px;
       border: 1px solid var(--gray-200);
+      white-space: nowrap;
     }
 
     .status-row {
-      grid-column: 1 / -1;
+      flex: 1 0 100%;
     }
 
     @media (max-width: 640px) {
@@ -340,7 +345,19 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
       }
 
       .account-details {
-        grid-template-columns: 1fr;
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .detail-row {
+        white-space: nowrap;
+        overflow: hidden;
+      }
+
+      .detail-value code {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 100%;
       }
     }
   `]
