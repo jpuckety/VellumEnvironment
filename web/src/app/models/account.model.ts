@@ -52,21 +52,6 @@ export interface VerificationResult {
   smtp: ComponentVerification;
 }
 
-export interface VerifyRequest {
-  id?: string;
-  name?: string;
-  imap_host: string;
-  imap_port: number;
-  imap_username: string;
-  imap_password?: string;
-  imap_use_tls: boolean;
-  smtp_host: string;
-  smtp_port: number;
-  smtp_username?: string;
-  smtp_password?: string;
-  smtp_use_tls: boolean;
-}
-
 export interface ProviderPreset {
   name: string;
   icon?: string;

@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable, map, timeout } from 'rxjs';
-import { Account, AccountSummary, ProviderPreset, VerificationResult, VerifyRequest } from '../models/account.model';
+import { Account, AccountSummary, ProviderPreset, VerificationResult } from '../models/account.model';
 
 @Injectable({
   providedIn: 'root'
@@ -38,8 +38,8 @@ export class AccountService {
     return this.http.delete<{ success: boolean }>(`${this.baseUrl}/${encodeURIComponent(id)}`);
   }
 
-  verifyAccount(data: VerifyRequest): Observable<VerificationResult> {
-    return this.http.post<VerificationResult>(`${this.baseUrl}/verify`, data).pipe(
+  verifyAccount(id: string): Observable<VerificationResult> {
+    return this.http.post<VerificationResult>(`${this.baseUrl}/${encodeURIComponent(id)}/verify`, {}).pipe(
       timeout({ first: 30_000 })
     );
   }

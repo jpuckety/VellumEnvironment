@@ -4,7 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { finalize } from 'rxjs';
 import { AccountService } from '../../services/account.service';
-import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../../models/account.model';
+import { Account, ProviderPreset, VerificationResult } from '../../models/account.model';
 
 @Component({
   selector: 'app-account-form',
@@ -366,15 +366,15 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
             <div class="verify-info">
               <h4 class="verify-title">Credential & Connection Verification</h4>
               <p class="verify-desc">
-                Test live IMAP authentication and SMTP handshake before saving.
+                Test live IMAP authentication and SMTP handshake using the last saved settings.
               </p>
-              <span *ngIf="!canVerify()" class="verify-hint">
+              <span *ngIf="verifyHint(accountForm.dirty)" class="verify-hint">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
                   <circle cx="12" cy="12" r="10"/>
                   <line x1="12" y1="8" x2="12" y2="12"/>
                   <line x1="12" y1="16" x2="12.01" y2="16"/>
                 </svg>
-                Enter a password above to verify a new account.
+                {{ verifyHint(accountForm.dirty) }}
               </span>
             </div>
 
@@ -382,8 +382,8 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
               type="button"
               id="verifyButton"
               class="btn btn-verify"
-              [disabled]="!canVerify() || verifying()"
-              (click)="verifyConnection()"
+              [disabled]="!canVerify(accountForm.dirty) || verifying()"
+              (click)="verifyConnection(accountForm.dirty)"
               title="Verify server connection and credentials"
             >
               <span *ngIf="verifying()" class="btn-spinner"></span>
@@ -749,41 +749,34 @@ export class AccountFormComponent implements OnInit {
   }
 
   /**
-   * Verify is available when a password is typed in the form, or when editing
-   * an account that already has a stored password (leave the fields blank).
+   * Verify is available only for a saved account whose form has no unsaved changes.
+   * Verification always uses the previously stored settings, not the live form.
    */
-  canVerify(): boolean {
-    const hasImapPass = !!(this.account.imap_password && this.account.imap_password.trim().length > 0);
-    const hasSmtpPass = !!(this.account.smtp_password && this.account.smtp_password.trim().length > 0);
-    if (hasImapPass || hasSmtpPass) {
-      return true;
-    }
-    return this.isEditMode && !!this.account.has_password && !!this.account.id;
+  canVerify(formDirty = false): boolean {
+    return this.isEditMode && !!this.account.id && !!this.account.has_password && !formDirty;
   }
 
-  verifyConnection(): void {
-    if (!this.canVerify() || this.verifying()) return;
+  verifyHint(formDirty = false): string {
+    if (!this.isEditMode || !this.account.id) {
+      return 'Save the account first, then verify the stored connection.';
+    }
+    if (formDirty) {
+      return 'Save your changes before verifying. Verification uses the last saved settings.';
+    }
+    if (!this.account.has_password) {
+      return 'This account has no stored password to verify.';
+    }
+    return '';
+  }
+
+  verifyConnection(formDirty = false): void {
+    if (!this.canVerify(formDirty) || this.verifying()) return;
 
     this.verifying.set(true);
     this.verificationResult.set(null);
     this.errorMessage.set('');
 
-    const req: VerifyRequest = {
-      id: this.account.id,
-      name: this.account.name,
-      imap_host: this.account.imap_host,
-      imap_port: Number(this.account.imap_port),
-      imap_username: this.account.imap_username,
-      imap_password: this.account.imap_password || undefined,
-      imap_use_tls: this.account.imap_use_tls,
-      smtp_host: this.account.smtp_host,
-      smtp_port: Number(this.account.smtp_port),
-      smtp_username: this.account.smtp_username || undefined,
-      smtp_password: this.account.smtp_password || undefined,
-      smtp_use_tls: this.account.smtp_use_tls
-    };
-
-    this.accountService.verifyAccount(req).pipe(
+    this.accountService.verifyAccount(this.account.id).pipe(
       finalize(() => this.verifying.set(false))
     ).subscribe({
       next: (res) => {

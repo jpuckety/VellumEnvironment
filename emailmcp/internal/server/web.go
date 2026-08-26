@@ -94,10 +94,10 @@ func (s *Server) mountWebRoutes(mux *http.ServeMux) {
 	// Account management API endpoints
 	mux.HandleFunc("GET /api/accounts", s.handleListAccounts)
 	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
-	mux.HandleFunc("POST /api/accounts/verify", s.handleVerifyAccount)
 	mux.HandleFunc("GET /api/accounts/{id}", s.handleGetAccount)
 	mux.HandleFunc("PUT /api/accounts/{id}", s.handleUpdateAccount)
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
+	mux.HandleFunc("POST /api/accounts/{id}/verify", s.handleVerifyAccount)
 
 	// User portal static web application
 	mux.HandleFunc("/portal", s.handleWebStatic)
@@ -530,7 +530,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
-// POST /api/accounts/verify - verifies IMAP & SMTP connectivity and credentials
+// POST /api/accounts/{id}/verify - verifies IMAP & SMTP using previously saved values
 func (s *Server) handleVerifyAccount(w http.ResponseWriter, r *http.Request) {
 	user, err := s.authenticator.Authenticate(r)
 	if err != nil {
@@ -538,68 +538,27 @@ func (s *Server) handleVerifyAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var payload AccountPayload
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid request body"})
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Account ID is required"})
 		return
 	}
 
-	imapPass := payload.IMAPPassword
-	smtpPass := payload.SMTPPassword
-
-	// If verifying an existing account and password was left blank, retrieve stored password
-	if imapPass == "" && payload.ID != "" {
-		existing, err := s.configStore.GetUserConfig(r.Context(), user.Subject, payload.ID)
-		if err == nil && existing != nil {
-			if imapPass == "" {
-				imapPass = existing.IMAPPassword
-			}
-			if smtpPass == "" {
-				smtpPass = existing.SMTPPassword
-			}
-		}
+	acc, err := s.configStore.GetUserConfig(r.Context(), user.Subject, id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": fmt.Sprintf("Account %q not found", id)})
+		return
 	}
 
-	if imapPass == "" {
+	if acc.IMAPPassword == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Password is required for connection verification"})
 		return
 	}
-
-	imapPort := payload.IMAPPort
-	if imapPort <= 0 {
-		imapPort = 993
+	if acc.SMTPUsername == "" {
+		acc.SMTPUsername = acc.IMAPUsername
 	}
-	smtpPort := payload.SMTPPort
-	if smtpPort <= 0 {
-		smtpPort = 587
-	}
-
-	imapUseTLS := boolDefault(payload.IMAPUseTLS, true)
-	smtpUseTLS := boolDefault(payload.SMTPUseTLS, true)
-
-	smtpUsername := payload.SMTPUsername
-	if smtpUsername == "" {
-		smtpUsername = payload.IMAPUsername
-	}
-	if smtpPass == "" {
-		smtpPass = imapPass
-	}
-
-	acc := &types.Account{
-		ID:           payload.ID,
-		OwnerUserID:  user.Subject,
-		Name:         payload.Name,
-		IMAPHost:     payload.IMAPHost,
-		IMAPPort:     imapPort,
-		IMAPUsername: payload.IMAPUsername,
-		IMAPPassword: imapPass,
-		IMAPUseTLS:   imapUseTLS,
-		SMTPHost:     payload.SMTPHost,
-		SMTPPort:     smtpPort,
-		SMTPUsername: smtpUsername,
-		SMTPPassword: smtpPass,
-		SMTPUseTLS:   smtpUseTLS,
-		FromAddress:  payload.FromAddress,
+	if acc.SMTPPassword == "" {
+		acc.SMTPPassword = acc.IMAPPassword
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), verifyOverallTimeout)

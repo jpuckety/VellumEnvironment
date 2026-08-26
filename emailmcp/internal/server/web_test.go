@@ -503,37 +503,104 @@ func TestAPIAccounts_Validation(t *testing.T) {
 	}
 }
 
-func TestAPIAccounts_VerifyRequiresPassword(t *testing.T) {
+func TestAPIAccounts_VerifyUsesSavedAccount(t *testing.T) {
 	srv, token := newTestWebServerWithSession(t)
 	ts := httptest.NewServer(srv.HTTPHandler())
 	defer ts.Close()
 
 	client := http.DefaultClient
 
-	// Verification without password must be rejected
-	useTLS := true
-	payload := AccountPayload{
-		Name:         "Verify Test",
+	reqMissing, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts/missing/verify", nil)
+	reqMissing.Header.Set("Authorization", "Bearer "+token)
+	respMissing, err := client.Do(reqMissing)
+	if err != nil {
+		t.Fatalf("POST /api/accounts/missing/verify: %v", err)
+	}
+	defer respMissing.Body.Close()
+	if respMissing.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing account, got %d", respMissing.StatusCode)
+	}
+
+	noPass := &types.Account{
+		ID:           "no-pass",
+		OwnerUserID:  "user123",
+		Name:         "No Password",
 		IMAPHost:     "imap.gmail.com",
 		IMAPPort:     993,
 		IMAPUsername: "user@gmail.com",
-		IMAPPassword: "", // empty!
-		IMAPUseTLS:   &useTLS,
+		IMAPPassword: "",
+		IMAPUseTLS:   true,
 		SMTPHost:     "smtp.gmail.com",
 		SMTPPort:     587,
-		SMTPUseTLS:   &useTLS,
+		SMTPUseTLS:   true,
 	}
-	bodyJSON, _ := json.Marshal(payload)
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts/verify", bytes.NewReader(bodyJSON))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	if err := srv.configStore.PutUserConfig(context.Background(), "user123", noPass); err != nil {
+		t.Fatalf("PutUserConfig no-pass: %v", err)
+	}
+	reqNoPass, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts/no-pass/verify", nil)
+	reqNoPass.Header.Set("Authorization", "Bearer "+token)
+	respNoPass, err := client.Do(reqNoPass)
 	if err != nil {
-		t.Fatalf("POST /api/accounts/verify: %v", err)
+		t.Fatalf("POST /api/accounts/no-pass/verify: %v", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request for empty password verification, got %d", resp.StatusCode)
+	defer respNoPass.Body.Close()
+	if respNoPass.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for account without stored password, got %d", respNoPass.StatusCode)
+	}
+
+	// Seed a stored account with a private host. Verification must use those
+	// saved values (and fail SSRF quickly) even if a public-host payload is sent.
+	saved := &types.Account{
+		ID:           "saved-mail",
+		OwnerUserID:  "user123",
+		Name:         "Saved Mail",
+		IMAPHost:     "127.0.0.1",
+		IMAPPort:     993,
+		IMAPUsername: "user@local",
+		IMAPPassword: "stored-secret",
+		IMAPUseTLS:   true,
+		SMTPHost:     "10.0.0.1",
+		SMTPPort:     587,
+		SMTPUsername: "user@local",
+		SMTPPassword: "stored-secret",
+		SMTPUseTLS:   true,
+	}
+	if err := srv.configStore.PutUserConfig(context.Background(), "user123", saved); err != nil {
+		t.Fatalf("PutUserConfig saved-mail: %v", err)
+	}
+
+	ignoredPayload, _ := json.Marshal(AccountPayload{
+		ID:           "saved-mail",
+		IMAPHost:     "imap.gmail.com",
+		IMAPUsername: "attacker@gmail.com",
+		IMAPPassword: "attacker-secret",
+		SMTPHost:     "smtp.gmail.com",
+	})
+	reqVerify, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/accounts/saved-mail/verify", bytes.NewReader(ignoredPayload))
+	reqVerify.Header.Set("Authorization", "Bearer "+token)
+	reqVerify.Header.Set("Content-Type", "application/json")
+	respVerify, err := client.Do(reqVerify)
+	if err != nil {
+		t.Fatalf("POST /api/accounts/saved-mail/verify: %v", err)
+	}
+	defer respVerify.Body.Close()
+	if respVerify.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(respVerify.Body)
+		t.Fatalf("expected 200 for saved-account verify, got %d: %s", respVerify.StatusCode, b)
+	}
+
+	var res VerificationResult
+	if err := json.NewDecoder(respVerify.Body).Decode(&res); err != nil {
+		t.Fatalf("decode verify result: %v", err)
+	}
+	if res.Success {
+		t.Fatal("expected stored private-host account verification to fail")
+	}
+	if res.IMAP.Success || res.SMTP.Success {
+		t.Fatalf("expected IMAP and SMTP to fail using stored private hosts, got: %+v", res)
+	}
+	if !strings.Contains(res.IMAP.Error, "not allowed") {
+		t.Fatalf("expected IMAP SSRF error from stored host, got %q", res.IMAP.Error)
 	}
 }
 
