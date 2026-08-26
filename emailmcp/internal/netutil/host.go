@@ -2,6 +2,7 @@
 package netutil
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -76,6 +77,12 @@ func IsLocalhost(host string) bool {
 // ValidatePublicHost resolves host and rejects private, link-local, and
 // metadata addresses to prevent SSRF via IMAP/SMTP configuration.
 func ValidatePublicHost(host string) error {
+	return ValidatePublicHostContext(context.Background(), host)
+}
+
+// ValidatePublicHostContext is ValidatePublicHost with a caller-provided
+// context so DNS lookups can be cancelled or timed out.
+func ValidatePublicHostContext(ctx context.Context, host string) error {
 	h := normalizeHost(host)
 	if h == "" {
 		return fmt.Errorf("host is required")
@@ -99,16 +106,19 @@ func ValidatePublicHost(host string) error {
 		return nil
 	}
 
-	ips, err := net.LookupIP(h)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, h)
 	if err != nil {
 		return fmt.Errorf("resolve host %q: %w", host, err)
 	}
-	if len(ips) == 0 {
+	if len(addrs) == 0 {
 		return fmt.Errorf("host %q resolved to no addresses", host)
 	}
-	for _, ip := range ips {
-		if isBlockedIP(ip) {
-			return fmt.Errorf("host %q resolves to a blocked address (%s)", host, ip.String())
+	for _, addr := range addrs {
+		if isBlockedIP(addr.IP) {
+			return fmt.Errorf("host %q resolves to a blocked address (%s)", host, addr.IP.String())
 		}
 	}
 	return nil

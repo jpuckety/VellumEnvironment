@@ -1,8 +1,10 @@
 package netutil
 
 import (
+	"context"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestIsLocalhost(t *testing.T) {
@@ -60,6 +62,24 @@ func TestValidatePublicHost_Empty(t *testing.T) {
 	}
 	if err := ValidatePublicHost("   "); err == nil {
 		t.Fatal("expected error for blank host")
+	}
+}
+
+func TestValidatePublicHostContext_Canceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ValidatePublicHostContext(ctx, "example.invalid")
+	if err == nil {
+		t.Fatal("expected cancelled DNS lookup to fail")
+	}
+}
+
+func TestCloseDoesNotApplyToLiteralIPs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	// Literal IPs skip DNS, so a tiny timeout must still succeed.
+	if err := ValidatePublicHostContext(ctx, "8.8.8.8"); err != nil {
+		t.Fatalf("literal IP should not require DNS: %v", err)
 	}
 }
 

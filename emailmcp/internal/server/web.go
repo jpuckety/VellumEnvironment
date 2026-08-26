@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -601,7 +602,9 @@ func (s *Server) handleVerifyAccount(w http.ResponseWriter, r *http.Request) {
 		FromAddress:  payload.FromAddress,
 	}
 
-	res := s.VerifyAccountCredentials(r.Context(), acc)
+	ctx, cancel := context.WithTimeout(r.Context(), verifyOverallTimeout)
+	defer cancel()
+	res := s.VerifyAccountCredentials(ctx, acc)
 	writeJSON(w, http.StatusOK, res)
 }
 

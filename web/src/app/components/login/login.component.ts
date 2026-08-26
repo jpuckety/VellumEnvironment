@@ -1,4 +1,5 @@
-import { Component, inject, OnInit } from '@angular/core';
+import { Component, inject, OnInit, signal } from '@angular/core';
+import { finalize } from 'rxjs';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
@@ -24,17 +25,17 @@ import { AuthService } from '../../services/auth.service';
           </p>
         </div>
 
-        <div *ngIf="errorMessage" class="alert alert-danger">
+        <div *ngIf="errorMessage()" class="alert alert-danger">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
             <circle cx="12" cy="12" r="10"/>
             <line x1="12" y1="8" x2="12" y2="12"/>
             <line x1="12" y1="16" x2="12.01" y2="16"/>
           </svg>
-          <span>{{ errorMessage }}</span>
+          <span>{{ errorMessage() }}</span>
         </div>
 
         <div class="auth-actions">
-          <button (click)="loginGoogle()" class="btn btn-google" [disabled]="loading">
+          <button (click)="loginGoogle()" class="btn btn-google" [disabled]="loading()">
             <svg viewBox="0 0 24 24" width="18" height="18">
               <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
               <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
@@ -64,10 +65,10 @@ import { AuthService } from '../../services/auth.service';
             <button
               type="submit"
               class="btn btn-secondary w-full"
-              [disabled]="!tokenInput.trim() || loading"
+              [disabled]="!tokenInput.trim() || loading()"
             >
-              <span *ngIf="loading">Validating...</span>
-              <span *ngIf="!loading">Authenticate with Token</span>
+              <span *ngIf="loading()">Validating...</span>
+              <span *ngIf="!loading()">Authenticate with Token</span>
             </button>
           </form>
         </div>
@@ -221,8 +222,8 @@ export class LoginComponent implements OnInit {
   private router = inject(Router);
 
   tokenInput = '';
-  loading = false;
-  errorMessage = '';
+  loading = signal(false);
+  errorMessage = signal('');
 
   ngOnInit(): void {
     if (this.authService.isAuthenticated()) {
@@ -235,23 +236,23 @@ export class LoginComponent implements OnInit {
   }
 
   loginWithToken(): void {
-    if (!this.tokenInput.trim()) return;
+    if (!this.tokenInput.trim() || this.loading()) return;
 
-    this.loading = true;
-    this.errorMessage = '';
+    this.loading.set(true);
+    this.errorMessage.set('');
 
-    this.authService.loginWithToken(this.tokenInput.trim()).subscribe({
+    this.authService.loginWithToken(this.tokenInput.trim()).pipe(
+      finalize(() => this.loading.set(false))
+    ).subscribe({
       next: (authenticated) => {
-        this.loading = false;
         if (authenticated) {
           this.router.navigate(['/']);
         } else {
-          this.errorMessage = 'Invalid access token. Please verify and try again.';
+          this.errorMessage.set('Invalid access token. Please verify and try again.');
         }
       },
       error: () => {
-        this.loading = false;
-        this.errorMessage = 'Authentication failed. Please check your token.';
+        this.errorMessage.set('Authentication failed. Please check your token.');
       }
     });
   }

@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/jpuckett/EmailMCP/emailmcp/internal/types"
 )
@@ -157,11 +159,51 @@ func TestVerifyAccountCredentials_CancelledContext(t *testing.T) {
 		SMTPUseTLS:   true,
 	}
 
+	start := time.Now()
 	res := srv.VerifyAccountCredentials(ctx, acc)
+	if time.Since(start) > time.Second {
+		t.Fatalf("cancelled verify took too long: %s", time.Since(start))
+	}
 	if res.Success {
 		t.Fatal("expected verify to fail on canceled context")
 	}
 	if res.IMAP.Success || res.SMTP.Success {
 		t.Fatalf("expected both IMAP and SMTP to fail on canceled context: %+v", res)
+	}
+}
+
+func TestWaitWithContext_HonorsCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	block := make(chan struct{})
+	defer close(block)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	err := waitWithContext(ctx, func() error {
+		<-block
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected context error")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("waitWithContext took too long: %s", time.Since(start))
+	}
+}
+
+func TestCloseNetConn_DoesNotHang(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	done := make(chan struct{})
+	go func() {
+		closeNetConn(a)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("closeNetConn hung")
 	}
 }

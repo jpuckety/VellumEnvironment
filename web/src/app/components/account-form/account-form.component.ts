@@ -39,28 +39,28 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
       </div>
 
       <!-- Verification Result Alert -->
-      <div *ngIf="verificationResult" [ngClass]="['alert', verificationResult.success ? 'alert-success' : 'alert-danger']">
+      <div *ngIf="verificationResult() as result" [ngClass]="['alert', result.success ? 'alert-success' : 'alert-danger']">
         <div class="verification-content">
           <div class="verification-header">
-            <svg *ngIf="verificationResult.success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+            <svg *ngIf="result.success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
               <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
               <polyline points="22 4 12 14.01 9 11.01"/>
             </svg>
-            <svg *ngIf="!verificationResult.success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+            <svg *ngIf="!result.success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
               <circle cx="12" cy="12" r="10"/>
               <line x1="12" y1="8" x2="12" y2="12"/>
               <line x1="12" y1="16" x2="12.01" y2="16"/>
             </svg>
-            <strong>{{ verificationResult.success ? 'Connection Verified Successfully' : 'Connection Verification Failed' }}</strong>
+            <strong>{{ result.success ? 'Connection Verified Successfully' : 'Connection Verification Failed' }}</strong>
           </div>
           <div class="verification-details">
             <div class="verify-item">
-              <span class="verify-badge" [ngClass]="verificationResult.imap.success ? 'badge-green' : 'badge-danger'">IMAP:</span>
-              <span>{{ verificationResult.imap.success ? (verificationResult.imap.message || 'Connected & Authenticated') : verificationResult.imap.error }}</span>
+              <span class="verify-badge" [ngClass]="result.imap.success ? 'badge-green' : 'badge-danger'">IMAP:</span>
+              <span>{{ result.imap.success ? (result.imap.message || 'Connected & Authenticated') : result.imap.error }}</span>
             </div>
             <div class="verify-item">
-              <span class="verify-badge" [ngClass]="verificationResult.smtp.success ? 'badge-green' : 'badge-danger'">SMTP:</span>
-              <span>{{ verificationResult.smtp.success ? (verificationResult.smtp.message || 'Connected & Authenticated') : verificationResult.smtp.error }}</span>
+              <span class="verify-badge" [ngClass]="result.smtp.success ? 'badge-green' : 'badge-danger'">SMTP:</span>
+              <span>{{ result.smtp.success ? (result.smtp.message || 'Connected & Authenticated') : result.smtp.error }}</span>
             </div>
           </div>
         </div>
@@ -382,16 +382,16 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
               type="button"
               id="verifyButton"
               class="btn btn-verify"
-              [disabled]="!canVerify() || verifying"
+              [disabled]="!canVerify() || verifying()"
               (click)="verifyConnection()"
               title="Verify server connection and credentials"
             >
-              <span *ngIf="verifying" class="btn-spinner"></span>
-              <svg *ngIf="!verifying" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+              <span *ngIf="verifying()" class="btn-spinner"></span>
+              <svg *ngIf="!verifying()" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
                 <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
                 <polyline points="22 4 12 14.01 9 11.01"/>
               </svg>
-              <span>{{ verifying ? 'Verifying...' : 'Verify Connection' }}</span>
+              <span>{{ verifying() ? 'Verifying...' : 'Verify Connection' }}</span>
             </button>
           </div>
 
@@ -404,10 +404,11 @@ import { Account, ProviderPreset, VerificationResult, VerifyRequest } from '../.
             <button
               type="submit"
               class="btn btn-primary"
-              [disabled]="saving || !accountForm.form.valid || (!isEditMode && !account.imap_password)"
+              [disabled]="saving() || !accountForm.form.valid || (!isEditMode && !account.imap_password)"
             >
-              <span *ngIf="saving">Saving...</span>
-              <span *ngIf="!saving">{{ isEditMode ? 'Update Account' : 'Save Account' }}</span>
+              <span *ngIf="saving()" class="btn-spinner"></span>
+              <span *ngIf="saving()">Saving...</span>
+              <span *ngIf="!saving()">{{ isEditMode ? 'Update Account' : 'Save Account' }}</span>
             </button>
           </div>
         </div>
@@ -661,8 +662,8 @@ export class AccountFormComponent implements OnInit {
   isEditMode = false;
   accountIdParam = '';
   loadingAccount = signal(false);
-  saving = false;
-  verifying = false;
+  saving = signal(false);
+  verifying = signal(false);
   errorMessage = signal('');
 
   showImapPassword = false;
@@ -671,7 +672,7 @@ export class AccountFormComponent implements OnInit {
   presets: ProviderPreset[] = [];
   selectedPresetInstructions = '';
 
-  verificationResult: VerificationResult | null = null;
+  verificationResult = signal<VerificationResult | null>(null);
 
   account: Account = {
     id: '',
@@ -761,10 +762,10 @@ export class AccountFormComponent implements OnInit {
   }
 
   verifyConnection(): void {
-    if (!this.canVerify()) return;
+    if (!this.canVerify() || this.verifying()) return;
 
-    this.verifying = true;
-    this.verificationResult = null;
+    this.verifying.set(true);
+    this.verificationResult.set(null);
     this.errorMessage.set('');
 
     const req: VerifyRequest = {
@@ -782,24 +783,27 @@ export class AccountFormComponent implements OnInit {
       smtp_use_tls: this.account.smtp_use_tls
     };
 
-    this.accountService.verifyAccount(req).subscribe({
+    this.accountService.verifyAccount(req).pipe(
+      finalize(() => this.verifying.set(false))
+    ).subscribe({
       next: (res) => {
-        this.verifying = false;
-        this.verificationResult = res;
+        this.verificationResult.set(res);
       },
       error: (err) => {
-        this.verifying = false;
-        this.verificationResult = {
+        const message = httpErrorMessage(err, 'Verification request failed');
+        this.verificationResult.set({
           success: false,
-          imap: { success: false, error: err?.error?.error || 'Verification request failed' },
-          smtp: { success: false, error: err?.error?.error || 'Verification request failed' }
-        };
+          imap: { success: false, error: message },
+          smtp: { success: false, error: message }
+        });
       }
     });
   }
 
   saveAccount(): void {
-    this.saving = true;
+    if (this.saving()) return;
+
+    this.saving.set(true);
     this.errorMessage.set('');
 
     // Clean up input types
@@ -828,15 +832,23 @@ export class AccountFormComponent implements OnInit {
       ? this.accountService.updateAccount(this.account.id, payload)
       : this.accountService.createAccount(payload);
 
-    saveObs.subscribe({
+    saveObs.pipe(
+      finalize(() => this.saving.set(false))
+    ).subscribe({
       next: () => {
-        this.saving = false;
         this.router.navigate(['/']);
       },
       error: (err) => {
-        this.saving = false;
-        this.errorMessage.set(err?.error?.error || 'Failed to save email account.');
+        this.errorMessage.set(httpErrorMessage(err, 'Failed to save email account.'));
       }
     });
   }
+}
+
+function httpErrorMessage(err: unknown, fallback: string): string {
+  const e = err as { name?: string; message?: string; error?: { error?: string } };
+  if (e?.name === 'TimeoutError') {
+    return 'The request timed out. Check host, port, and network connectivity.';
+  }
+  return e?.error?.error || fallback;
 }

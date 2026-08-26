@@ -30,21 +30,21 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
       </div>
 
       <!-- Alerts -->
-      <div *ngIf="successMessage" class="alert alert-success">
+      <div *ngIf="successMessage()" class="alert alert-success">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
           <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
           <polyline points="22 4 12 14.01 9 11.01"/>
         </svg>
-        <span>{{ successMessage }}</span>
+        <span>{{ successMessage() }}</span>
       </div>
 
-      <div *ngIf="errorMessage" class="alert alert-danger">
+      <div *ngIf="errorMessage()" class="alert alert-danger">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
           <circle cx="12" cy="12" r="10"/>
           <line x1="12" y1="8" x2="12" y2="12"/>
           <line x1="12" y1="16" x2="12.01" y2="16"/>
         </svg>
-        <span>{{ errorMessage }}</span>
+        <span>{{ errorMessage() }}</span>
       </div>
 
       <!-- Loading State -->
@@ -151,11 +151,11 @@ import { ConfirmDialogComponent } from '../confirm-dialog/confirm-dialog.compone
 
       <!-- Delete Confirmation Dialog -->
       <app-confirm-dialog
-        [isOpen]="isDeleteDialogOpen"
+        [isOpen]="isDeleteDialogOpen()"
         title="Delete Email Account"
         [message]="getDeleteMessage()"
         confirmText="Delete Account"
-        [loading]="deleting"
+        [loading]="deleting()"
         (confirm)="confirmDelete()"
         (cancel)="closeDeleteDialog()"
       ></app-confirm-dialog>
@@ -351,12 +351,12 @@ export class AccountListComponent implements OnInit {
 
   accounts = signal<AccountSummary[]>([]);
   loading = signal(true);
-  errorMessage = '';
-  successMessage = '';
+  errorMessage = signal('');
+  successMessage = signal('');
 
-  isDeleteDialogOpen = false;
+  isDeleteDialogOpen = signal(false);
   selectedAccount: AccountSummary | null = null;
-  deleting = false;
+  deleting = signal(false);
 
   ngOnInit(): void {
     this.loadAccounts();
@@ -364,7 +364,7 @@ export class AccountListComponent implements OnInit {
 
   loadAccounts(): void {
     this.loading.set(true);
-    this.errorMessage = '';
+    this.errorMessage.set('');
 
     this.accountService.getAccounts().pipe(
       finalize(() => this.loading.set(false))
@@ -374,7 +374,7 @@ export class AccountListComponent implements OnInit {
       },
       error: (err) => {
         this.accounts.set([]);
-        this.errorMessage = err?.error?.error || 'Failed to load email accounts.';
+        this.errorMessage.set(err?.error?.error || 'Failed to load email accounts.');
       }
     });
   }
@@ -385,11 +385,12 @@ export class AccountListComponent implements OnInit {
 
   openDeleteDialog(acc: AccountSummary): void {
     this.selectedAccount = acc;
-    this.isDeleteDialogOpen = true;
+    this.isDeleteDialogOpen.set(true);
   }
 
   closeDeleteDialog(): void {
-    this.isDeleteDialogOpen = false;
+    if (this.deleting()) return;
+    this.isDeleteDialogOpen.set(false);
     this.selectedAccount = null;
   }
 
@@ -399,24 +400,26 @@ export class AccountListComponent implements OnInit {
   }
 
   confirmDelete(): void {
-    if (!this.selectedAccount) return;
+    if (!this.selectedAccount || this.deleting()) return;
 
-    this.deleting = true;
-    this.errorMessage = '';
-    this.successMessage = '';
+    this.deleting.set(true);
+    this.errorMessage.set('');
+    this.successMessage.set('');
 
     const name = this.selectedAccount.name;
-    this.accountService.deleteAccount(this.selectedAccount.id).subscribe({
+    this.accountService.deleteAccount(this.selectedAccount.id).pipe(
+      finalize(() => this.deleting.set(false))
+    ).subscribe({
       next: () => {
-        this.deleting = false;
-        this.closeDeleteDialog();
-        this.successMessage = `Account "${name}" deleted successfully.`;
+        this.isDeleteDialogOpen.set(false);
+        this.selectedAccount = null;
+        this.successMessage.set(`Account "${name}" deleted successfully.`);
         this.loadAccounts();
       },
       error: (err) => {
-        this.deleting = false;
-        this.closeDeleteDialog();
-        this.errorMessage = err?.error?.error || `Failed to delete account "${name}".`;
+        this.isDeleteDialogOpen.set(false);
+        this.selectedAccount = null;
+        this.errorMessage.set(err?.error?.error || `Failed to delete account "${name}".`);
       }
     });
   }

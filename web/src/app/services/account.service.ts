@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
-import { Observable, map } from 'rxjs';
+import { Observable, map, timeout } from 'rxjs';
 import { Account, AccountSummary, ProviderPreset, VerificationResult, VerifyRequest } from '../models/account.model';
 
 @Injectable({
@@ -39,7 +39,9 @@ export class AccountService {
   }
 
   verifyAccount(data: VerifyRequest): Observable<VerificationResult> {
-    return this.http.post<VerificationResult>(`${this.baseUrl}/verify`, data);
+    return this.http.post<VerificationResult>(`${this.baseUrl}/verify`, data).pipe(
+      timeout({ first: 30_000 })
+    );
   }
 
   getPresets(): ProviderPreset[] {
